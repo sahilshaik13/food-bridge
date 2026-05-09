@@ -1,0 +1,14 @@
+firebase-admin>=6.5.0
+fastapi>=0.115.0
+google-cloud-aiplatform>=1.71.0
+google-cloud-bigquery>=3.25.0
+google-cloud-pubsub>=2.23.0
+google-cloud-tasks>=2.16.5
+google-cloud-secret-manager>=2.20.2
+google-auth>=2.35.0
+python-multipart>=0.0.9
+requests>=2.33.1
+google-cloud-storage>=2.18.2
+google-cloud-kms>=2.20.0
+uvicorn[standard]>=0.30.6
+reportlab>=4.2.2

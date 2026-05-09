@@ -1,0 +1,58 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  background: #f7f3ea;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  background:
+    linear-gradient(90deg, rgba(23, 32, 27, 0.045) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(23, 32, 27, 0.04) 1px, transparent 1px),
+    #f7f3ea;
+  background-size: 42px 42px;
+  color: #17201b;
+  font-family: Aptos, "Segoe UI", sans-serif;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+.map-grid {
+  background:
+    radial-gradient(circle at 20% 30%, rgba(40, 122, 79, 0.34), transparent 16%),
+    radial-gradient(circle at 78% 34%, rgba(182, 64, 42, 0.32), transparent 15%),
+    radial-gradient(circle at 56% 78%, rgba(232, 166, 58, 0.34), transparent 14%),
+    linear-gradient(90deg, rgba(23, 32, 27, 0.12) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(23, 32, 27, 0.12) 1px, transparent 1px),
+    #e7eadf;
+  background-size: auto, auto, auto, 28px 28px, 28px 28px, auto;
+}
+
+/* Skeleton Loading - Section 13 of Spec */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.skeleton {
+  background: linear-gradient(90deg, #e5e7eb 25%, #f3f4f6 50%, #e5e7eb 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s infinite;
+  border-radius: 6px;
+}

@@ -1,0 +1,79 @@
+# Local environment and credentials
+.env
+.env.*
+.env.local
+!.env.example
+!.env.local.example
+
+# Google/Firebase service account keys
+*.json
+!package.json
+!tsconfig.json
+!next.config.json
+!firebase.json
+!composer.json
+!*.schema.json
+*firebase-adminsdk*.json
+foodbridge-*.json
+*-service-account*.json
+google-application-credentials*.json
+cred*.json
+secret*.json
+key*.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.sql
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+dist/
+coverage/
+
+# Local OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+#Markdown Files
+*.md
+!README.md
+
+# LaTeX templates and build artifacts
+*.tex
+*.aux
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.bbl
+*.blg
+
+# Generated report files
+*.pdf
+
+# Temp/cache artifacts
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+# Cursor/local tooling state
+.cursor/
+.claude/
+.agents/
