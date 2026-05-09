@@ -53,7 +53,7 @@ export function MapViewer({ markers, center = { lat: 17.385, lng: 78.4867 }, zoo
     }
 
     const script = document.createElement("script");
-    const apiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || "AIzaSyCfIxf2p4RsybEI6_I4YOKETCW2QFsqfl0";
+    const apiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
     if (!apiKey) {
       setMapError("Google Maps API key is missing.");
       return;

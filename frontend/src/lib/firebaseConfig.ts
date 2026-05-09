@@ -19,7 +19,7 @@ const requiredEnv = (name: string, fallback?: string): string => {
 };
 
 export const firebaseConfig: FirebaseWebConfig = {
-  apiKey: requiredEnv("NEXT_PUBLIC_FIREBASE_API_KEY", "AIzaSyCZ5O5rPE8pF0dawNqSRID5bXnSzn1gGAg"),
+  apiKey: requiredEnv("NEXT_PUBLIC_FIREBASE_API_KEY"),
   authDomain: requiredEnv("NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN", "foodbridge-4f96f.firebaseapp.com"),
   databaseURL: requiredEnv("NEXT_PUBLIC_FIREBASE_DATABASE_URL", "https://foodbridge-4f96f-default-rtdb.asia-southeast1.firebasedatabase.app"),
   projectId: requiredEnv("NEXT_PUBLIC_FIREBASE_PROJECT_ID", "foodbridge-4f96f"),
