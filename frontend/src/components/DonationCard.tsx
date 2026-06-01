@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { CheckCircle2, ShieldAlert, Truck, Loader2, XCircle, Route, X, Navigation } from "lucide-react";
-import { FreshnessRing } from "@/components/FreshnessRing";
+import { CheckCircle2, ShieldAlert, Loader2, XCircle, Route, X, Navigation } from "lucide-react";
+import { FreshnessTimer } from "@/components/FreshnessTimer";
+import { NutritionalMatch } from "@/components/NutritionalMatch";
 import { StatusBadge } from "@/components/StatusBadge";
 import { useAuth } from "@/lib/AuthProvider";
 import { apiGet, apiSend } from "@/lib/api";
@@ -17,6 +18,18 @@ export function DonationCard({ donation: initial, onUpdate }: { donation: any; o
   const [routeError, setRouteError] = useState<string | null>(null);
   const [ngoLocation, setNgoLocation] = useState<{ lat: number; lng: number; name: string } | null>(null);
   const topMatch = donation.ngo_queue?.[0];
+
+  const factorToText = (factor: string) => {
+    if (!factor) return "";
+    if (factor === "fallback_scan_used") return "Fallback scan used";
+    if (factor === "visual_safety_failed") return "Visual safety failed";
+    if (factor === "short_freshness_window") return "Short freshness window";
+    if (factor === "long_freshness_window") return "Long freshness window";
+    if (factor === "large_quantity_outlier") return "Large quantity outlier";
+    if (factor.startsWith("risk_keyword:")) return `Risk keyword: ${factor.split(":")[1]}`;
+    if (factor === "baseline_confidence") return "Baseline model confidence";
+    return factor.replaceAll("_", " ");
+  };
 
   const updateStatus = async (status: string, extra: Record<string, any> = {}) => {
     setLoading(true);
@@ -89,7 +102,7 @@ export function DonationCard({ donation: initial, onUpdate }: { donation: any; o
           </div>
           <p className="mt-0.5 truncate text-xs text-ink/55">{donation.donor_name} · {donation.location?.area}</p>
         </div>
-        <FreshnessRing expiresAt={donation.expires_at} />
+        <FreshnessTimer expiresAt={donation.expires_at} />
       </div>
 
       {/* Stats */}
@@ -130,14 +143,26 @@ export function DonationCard({ donation: initial, onUpdate }: { donation: any; o
           </span>
         </div>
 
-        {topMatch && donation.status !== "completed" && (
-          <div className="flex items-start gap-2 text-xs text-ink/70">
-            <Truck className="mt-0.5 size-4 shrink-0 text-civic" />
-            <span>
-              Best match: <strong className="text-ink">{topMatch.ngo_name}</strong> ({topMatch.distance_km} km · score {topMatch.total_score})
-            </span>
+        {donation.accuracy && (
+          <div className="rounded-xl border border-ink/10 bg-paper/60 p-3 text-xs text-ink/75">
+            <p>
+              <strong className="text-ink">Accuracy:</strong>{" "}
+              score {Math.round((donation.accuracy.score || 0) * 100)}% ·
+              {" "}band <strong className="capitalize text-ink">{donation.accuracy.band}</strong> ·
+              {" "}recommendation <strong className="text-ink">{donation.accuracy.recommendation}</strong>
+            </p>
+            <p className="mt-1 text-ink/70">
+              {donation.accuracy.explanation || "Model explanation unavailable."}
+            </p>
+            {Array.isArray(donation.accuracy.top_factors) && donation.accuracy.top_factors.length > 0 && (
+              <p className="mt-1 text-ink/60">
+                Factors: {donation.accuracy.top_factors.map((item: string) => factorToText(item)).join(", ")}
+              </p>
+            )}
           </div>
         )}
+
+        {topMatch && donation.status !== "completed" && <NutritionalMatch match={topMatch} />}
 
         <button
           onClick={openRoute}

@@ -1,9 +1,13 @@
+import logging
+
 from fastapi import HTTPException, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from app.core.cloud_clients import initialize_firebase_app
 from app.models import Role
 
 security = HTTPBearer()
+logger = logging.getLogger(__name__)
+FIREBASE_CLOCK_SKEW_SECONDS = 10
 
 
 def verify_firebase_token(
@@ -17,9 +21,10 @@ def verify_firebase_token(
     from firebase_admin import auth
     token = credentials.credentials
     try:
-        decoded = auth.verify_id_token(token)
+        decoded = auth.verify_id_token(token, clock_skew_seconds=FIREBASE_CLOCK_SKEW_SECONDS)
         return decoded
     except Exception as e:
+        logger.exception("Firebase token verification failed")
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 
@@ -31,9 +36,10 @@ def verify_firebase_token_string(token: str) -> dict:
 
     from firebase_admin import auth
     try:
-        decoded = auth.verify_id_token(token)
+        decoded = auth.verify_id_token(token, clock_skew_seconds=FIREBASE_CLOCK_SKEW_SECONDS)
         return decoded
     except Exception as e:
+        logger.exception("Firebase token string verification failed")
         raise HTTPException(status_code=401, detail=f"Invalid token string: {e}")
 
 

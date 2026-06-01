@@ -88,6 +88,31 @@ export async function apiSend<T = any>(path: string, payload: unknown, method: "
   return (await response.json()) as T;
 }
 
+/** Multipart (e.g. donation `payload` JSON + food `photo`). Do not set Content-Type — browser sets boundary. */
+export async function apiSendForm<T = any>(
+  path: string,
+  formData: FormData,
+  method: "POST" | "PATCH" = "POST"
+): Promise<T> {
+  const base = requireApiBase();
+  const token = getToken();
+  const headers: Record<string, string> = {};
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  const response = await fetch(`${base}${path}`, {
+    method,
+    headers,
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(errorText || `Request failed: ${response.status}`);
+  }
+
+  return (await response.json()) as T;
+}
+
 export async function replayPendingActions(maxAgeMs = 5 * 60 * 1000): Promise<void> {
   if (typeof window === "undefined") return;
   const pendingKey = "fb_pending_actions";

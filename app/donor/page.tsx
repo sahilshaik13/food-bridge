@@ -6,11 +6,13 @@ import { DonationForm } from "@/components/DonationForm";
 import { DonationCard } from "@/components/DonationCard";
 import { ImpactStats } from "@/components/ImpactStats";
 import { TelegramPanel } from "@/components/TelegramPanel";
+import { PredictionAlert } from "@/components/PredictionAlert";
+import { LeaderboardCard } from "@/components/LeaderboardCard";
 import { useAuth } from "@/lib/AuthProvider";
 import { apiGetCached, apiSend, replayPendingActions } from "@/lib/api";
 import { useState, useEffect } from "react";
 import Link from "next/link";
-import { BarChart3, Trophy, Bell, AlertTriangle } from "lucide-react";
+import { BarChart3, Bell, AlertTriangle, Info } from "lucide-react";
 import { onValue, ref } from "firebase/database";
 import { realtimeDatabase } from "@/lib/firebase";
 
@@ -32,6 +34,8 @@ function DonorDashboard() {
   const [dismissedPopupIds, setDismissedPopupIds] = useState<string[]>([]);
   const [poolQtyById, setPoolQtyById] = useState<Record<string, string>>({});
   const [apiError, setApiError] = useState<string | null>(null);
+  const [myDonorProfile, setMyDonorProfile] = useState<any>(null);
+  const [trustScoreInfoOpen, setTrustScoreInfoOpen] = useState(false);
 
   const normalizeDonation = (item: any) => {
     const normalizeTs = (value: any) => {
@@ -63,6 +67,10 @@ function DonorDashboard() {
       setNotifications(notificationsData);
       setEmergencyPools(poolsData);
       setActiveEmergencyPopups(poolsData);
+      if (profile?.entity_id) {
+        const donorData = await apiGetCached<any>(`/donors/${profile.entity_id}`, 8000);
+        setMyDonorProfile(donorData);
+      }
     } catch (err: any) {
       setApiError("Backend unreachable or request failed. Donor data is not loaded.");
       setDonations([]);
@@ -70,6 +78,7 @@ function DonorDashboard() {
       setImpact(null);
       setEmergencyPools([]);
       setActiveEmergencyPopups([]);
+      setMyDonorProfile(null);
     }
   };
 
@@ -102,6 +111,15 @@ function DonorDashboard() {
     return () => unsub();
   }, [profile?.entity_id]);
 
+  useEffect(() => {
+    const impactRef = ref(realtimeDatabase, "metrics/impact/global");
+    const unsub = onValue(impactRef, (snap) => {
+      const val = snap.val();
+      if (val) setImpact(val);
+    });
+    return () => unsub();
+  }, []);
+
   const contributeToPool = async (requestId: string) => {
     if (!profile?.entity_id) return;
     const quantity = Number(poolQtyById[requestId] || "0");
@@ -115,7 +133,14 @@ function DonorDashboard() {
   };
 
   const unread = notifications.filter((n: any) => !n.read).length;
-  const activeStatuses = new Set(["pending_match", "notified", "accepted", "assigned", "needs_review"]);
+  const activeStatuses = new Set([
+    "pending_match",
+    "pending_scan_retry",
+    "notified",
+    "accepted",
+    "assigned",
+    "needs_review",
+  ]);
   const activeDonations = donations.filter((d: any) => activeStatuses.has(d.status));
   const visiblePopup = activeEmergencyPopups.find((item) => !dismissedPopupIds.includes(item.id));
 
@@ -171,6 +196,108 @@ function DonorDashboard() {
         </div>
 
         <ImpactStats impact={impact} />
+        <div className="mt-6 grid gap-4 lg:grid-cols-2">
+          <PredictionAlert donorId={profile?.entity_id} />
+          <LeaderboardCard />
+        </div>
+        {myDonorProfile?.score && (
+          <div className="mt-4 rounded-2xl border border-ink/10 bg-white p-4 shadow-lift">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-[10px] font-bold uppercase tracking-widest text-ink/50">My Trust Score</p>
+                <p className="mt-1 text-2xl font-bold text-ink">
+                  {myDonorProfile.score.trust_score}{" "}
+                  <span className="text-base font-semibold capitalize text-ink/60">({myDonorProfile.score.trust_tier})</span>
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setTrustScoreInfoOpen(true)}
+                className="flex size-9 shrink-0 items-center justify-center rounded-full border border-ink/15 bg-paper/80 text-ink/70 shadow-sm hover:bg-field hover:text-ink"
+                aria-label="What is my trust score?"
+              >
+                <Info className="size-4" strokeWidth={2.25} />
+              </button>
+            </div>
+          </div>
+        )}
+        {trustScoreInfoOpen && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+            onClick={() => setTrustScoreInfoOpen(false)}
+            role="presentation"
+          >
+            <div
+              className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl bg-white p-6 shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="trust-score-dialog-title"
+            >
+              <h3 id="trust-score-dialog-title" className="text-lg font-bold text-ink">
+                Trust score
+              </h3>
+              <p className="mt-3 text-sm leading-relaxed text-ink/75">
+                Your trust score summarizes how reliably surplus postings move through FoodBridge — verification, compliance signals,
+                successful completions, and problem donations all contribute.
+              </p>
+              <p className="mt-3 text-sm font-semibold text-ink">How it is calculated</p>
+              <ul className="mt-2 list-disc space-y-1.5 pl-5 text-sm text-ink/75">
+                <li>
+                  <strong className="text-ink">Base registration</strong>: +20 points when your donor profile is active.
+                </li>
+                <li>
+                  <strong className="text-ink">FSSAI licence on file</strong>: +20.
+                </li>
+                <li>
+                  <strong className="text-ink">Verification</strong>: +10 if verified; suspended profiles lose 20 points.
+                </li>
+                <li>
+                  <strong className="text-ink">Completed donations</strong>: up to +30 total (+2 per completed donation, capped).
+                </li>
+                <li>
+                  <strong className="text-ink">Rejections / expiry / waste</strong>: up to −30 total (−5 each, capped).
+                </li>
+                <li>
+                  <strong className="text-ink">Manual review flags</strong>: up to −15 (−3 per flagged donation, capped).
+                </li>
+              </ul>
+              <p className="mt-3 text-sm leading-relaxed text-ink/75">
+                Those inputs produce a raw score and your factor lines (shown on admin views). We then spread scores across{" "}
+                <strong className="text-ink">all donors</strong> so the top two performers earn distinct high scores, the bottom three
+                distinct lows, and everyone else sits in a varied middle band — tiers stay meaningful instead of clustering everyone in one
+                tier.
+              </p>
+              <p className="mt-3 border-l-2 border-ink/15 pl-3 text-sm leading-relaxed text-ink/70">
+                <strong className="text-ink">Calibration anchors:</strong> With at least five donors, ranks map to fixed highs and lows —
+                top two get <strong className="text-ink">97</strong> and <strong className="text-ink">93</strong>; bottom three get{" "}
+                <strong className="text-ink">26</strong>, <strong className="text-ink">32</strong>, and <strong className="text-ink">38</strong>.
+                With fewer donors we still reserve top and bottom slots where possible. Integer tie-breaks may nudge a score by ±1 so no two
+                donors share the same number.
+              </p>
+              <p className="mt-3 text-sm font-semibold text-ink">Tiers (after calibration)</p>
+              <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-ink/75">
+                <li>Platinum — score 85 and above</li>
+                <li>Gold — 65–84</li>
+                <li>Silver — 40–64</li>
+                <li>Bronze — below 40</li>
+              </ul>
+              <p className="mt-3 text-sm leading-relaxed text-ink/75">
+                Raw points from the rules above add up to at most about <strong className="text-ink">80</strong> (every lever is capped).
+                The dashboard then maps everyone onto the <strong className="text-ink">0–100</strong> scale so tiers stay readable; typical{" "}
+                <strong className="text-ink">top performers land near 97</strong>. Repeated completions and fewer rejections or review flags
+                move you up.
+              </p>
+              <button
+                type="button"
+                onClick={() => setTrustScoreInfoOpen(false)}
+                className="mt-6 w-full rounded-xl bg-leaf py-2.5 text-sm font-bold text-white shadow-line hover:bg-ink"
+              >
+                Got it
+              </button>
+            </div>
+          </div>
+        )}
         {emergencyPools.length > 0 && (
           <div className="mt-6 rounded-2xl border border-ink/10 bg-white p-5 shadow-lift">
             <h2 className="text-lg font-bold text-ink">Emergency Pool Broadcasts</h2>

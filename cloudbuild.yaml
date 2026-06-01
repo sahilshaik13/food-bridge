@@ -1,48 +1,178 @@
-# Cloud Build configuration for FoodBridge Backend
-# Triggers on push to main branch
+# Cloud Build: backend (FastAPI + LaTeX + Vertex AI stack) + Next.js → Cloud Run.
+# Prereqs: APIs enabled, Secret Manager secrets (use scripts/sync_env_to_gcp_secrets.ps1).
+# Deploy: gcloud builds submit . --config cloudbuild.yaml
+#        .\scripts\deploy_foodbridge_cloud_run.ps1 -SyncSecrets
+
+substitutions:
+  _REGION: asia-south1
+  _SERVICE_NAME_API: foodbridge-api
+  _SERVICE_NAME_WEB: foodbridge-web
+  _FIREBASE_PROJECT_ID: foodbridge-4f96f
+  _FIREBASE_DATABASE_URL: https://foodbridge-4f96f-default-rtdb.asia-southeast1.firebasedatabase.app
+  _FIREBASE_STORAGE_BUCKET: foodbridge-4f96f.firebasestorage.app
+  # Production web origin for CORS + links (use Cloud Run web URL or Hosting URL).
+  _FRONTEND_BASE_URL: https://foodbridge.web.app
+  # Must match Cloud Run API HTTPS URL (Telegram slave webhooks).
+  _TELEGRAM_SLAVE_WEBHOOK_BASE_URL: https://foodbridge-api-aqg35pktda-el.a.run.app
+  # Baked into Next at build time — set to your API Cloud Run URL.
+  _NEXT_PUBLIC_API_BASE_URL: https://foodbridge-api-aqg35pktda-el.a.run.app
+  # Override via deploy script / trigger — never ship the placeholder to production.
+  _NEXT_PUBLIC_FIREBASE_API_KEY: ""
+  _NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: foodbridge-4f96f.firebaseapp.com
+  _NEXT_PUBLIC_FIREBASE_DATABASE_URL: https://foodbridge-4f96f-default-rtdb.asia-southeast1.firebasedatabase.app
+  _NEXT_PUBLIC_FIREBASE_PROJECT_ID: foodbridge-4f96f
+  _NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET: foodbridge-4f96f.firebasestorage.app
+  _NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID: "507153921282"
+  _NEXT_PUBLIC_FIREBASE_APP_ID: "1:507153921282:web:fb3739f1e8e01adba0be1b"
+  _NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID: G-N37VKGNTKJ
+  _NEXT_PUBLIC_GOOGLE_MAPS_API_KEY: ""
+  _NEXT_PUBLIC_TIMER_ACCELERATION: "10"
+
 steps:
-  # Build the Docker image
+  # --- Backend: TeX Live + FastAPI (LaTeX PDFs + same AI/Vertex code path as local) ---
   - name: "gcr.io/cloud-builders/docker"
     args:
       - "build"
+      - "-f"
+      - "backend/Dockerfile"
       - "-t"
-      - "gcr.io/$PROJECT_ID/foodbridge-api:$COMMIT_SHA"
+      - "gcr.io/$PROJECT_ID/${_SERVICE_NAME_API}:$BUILD_ID"
       - "-t"
-      - "gcr.io/$PROJECT_ID/foodbridge-api:latest"
-      - "./backend"
-
-  # Push to Container Registry
-  - name: "gcr.io/cloud-builders/docker"
-    args:
-      - "push"
-      - "gcr.io/$PROJECT_ID/foodbridge-api:$COMMIT_SHA"
+      - "gcr.io/$PROJECT_ID/${_SERVICE_NAME_API}:latest"
+      - "."
 
   - name: "gcr.io/cloud-builders/docker"
-    args:
-      - "push"
-      - "gcr.io/$PROJECT_ID/foodbridge-api:latest"
+    args: ["push", "gcr.io/$PROJECT_ID/${_SERVICE_NAME_API}:$BUILD_ID"]
 
-  # Deploy to Cloud Run
+  - name: "gcr.io/cloud-builders/docker"
+    args: ["push", "gcr.io/$PROJECT_ID/${_SERVICE_NAME_API}:latest"]
+
+  # --- Frontend: Next.js (NEXT_PUBLIC_* at build time) ---
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "-f"
+      - "Dockerfile"
+      - "--build-arg"
+      - "NEXT_PUBLIC_API_BASE_URL=${_NEXT_PUBLIC_API_BASE_URL}"
+      - "--build-arg"
+      - "NEXT_PUBLIC_FIREBASE_API_KEY=${_NEXT_PUBLIC_FIREBASE_API_KEY}"
+      - "--build-arg"
+      - "NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=${_NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN}"
+      - "--build-arg"
+      - "NEXT_PUBLIC_FIREBASE_DATABASE_URL=${_NEXT_PUBLIC_FIREBASE_DATABASE_URL}"
+      - "--build-arg"
+      - "NEXT_PUBLIC_FIREBASE_PROJECT_ID=${_NEXT_PUBLIC_FIREBASE_PROJECT_ID}"
+      - "--build-arg"
+      - "NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=${_NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET}"
+      - "--build-arg"
+      - "NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=${_NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID}"
+      - "--build-arg"
+      - "NEXT_PUBLIC_FIREBASE_APP_ID=${_NEXT_PUBLIC_FIREBASE_APP_ID}"
+      - "--build-arg"
+      - "NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID=${_NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID}"
+      - "--build-arg"
+      - "NEXT_PUBLIC_GOOGLE_MAPS_API_KEY=${_NEXT_PUBLIC_GOOGLE_MAPS_API_KEY}"
+      - "--build-arg"
+      - "NEXT_PUBLIC_TIMER_ACCELERATION=${_NEXT_PUBLIC_TIMER_ACCELERATION}"
+      - "-t"
+      - "gcr.io/$PROJECT_ID/${_SERVICE_NAME_WEB}:$BUILD_ID"
+      - "-t"
+      - "gcr.io/$PROJECT_ID/${_SERVICE_NAME_WEB}:latest"
+      - "."
+
+  - name: "gcr.io/cloud-builders/docker"
+    args: ["push", "gcr.io/$PROJECT_ID/${_SERVICE_NAME_WEB}:$BUILD_ID"]
+
+  - name: "gcr.io/cloud-builders/docker"
+    args: ["push", "gcr.io/$PROJECT_ID/${_SERVICE_NAME_WEB}:latest"]
+
   - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     entrypoint: "gcloud"
     args:
       - "run"
       - "deploy"
-      - "foodbridge-api"
+      - "${_SERVICE_NAME_API}"
       - "--image"
-      - "gcr.io/$PROJECT_ID/foodbridge-api:$COMMIT_SHA"
+      - "gcr.io/$PROJECT_ID/${_SERVICE_NAME_API}:$BUILD_ID"
       - "--region"
-      - "asia-south1"
+      - "${_REGION}"
       - "--platform"
       - "managed"
       - "--allow-unauthenticated"
+      - "--memory"
+      - "2Gi"
+      - "--cpu"
+      - "2"
+      - "--timeout"
+      - "300"
+      - "--min-instances"
+      - "0"
+      - "--max-instances"
+      - "10"
       - "--set-env-vars"
-      - "GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GCP_REGION=asia-south1,GCP_LOCATION=asia-south1"
+      - >-
+        FIREBASE_PROJECT_ID=${_FIREBASE_PROJECT_ID},
+        FIREBASE_DATABASE_URL=${_FIREBASE_DATABASE_URL},
+        FIREBASE_STORAGE_BUCKET=${_FIREBASE_STORAGE_BUCKET},
+        FIRESTORE_SYNC_ENABLED=true,
+        GOOGLE_CLOUD_PROJECT=$PROJECT_ID,
+        GCP_REGION=${_REGION},
+        GCP_LOCATION=${_REGION},
+        VERTEX_AI_LOCATION=global,
+        VERTEX_AI_MODEL_ID=gemini-3-flash-preview,
+        VERTEX_AI_MODEL_VERSION=preview,
+        ACCURACY_VERTEX_ENABLED=true,
+        MATCHING_VERTEX_ENABLED=true,
+        PUBSUB_MATCHING_ENABLED=false,
+        PUBSUB_MATCHING_INLINE_COMPLETION=true,
+        EMERGENCY_VERTEX_ENABLED=true,
+        DISABLE_AI_INTEGRATION=false,
+        REQUIRE_DONATION_PHOTO_FOR_HTTP=true,
+        ESCALATION_CLOUD_TASKS_ENABLED=true,
+        ML_EXPORT_TO_BIGQUERY=false,
+        FRONTEND_BASE_URL=${_FRONTEND_BASE_URL},
+        TELEGRAM_SLAVE_WEBHOOK_BASE_URL=${_TELEGRAM_SLAVE_WEBHOOK_BASE_URL},
+        TIMER_ACCELERATION=10,
+        KMS_LOCATION=${_REGION},
+        HEATMAP_GAP_RADIUS_KM=5,
+        HEATMAP_GAP_MIN_BENEFICIARIES=40,
+        SURPLUS_PRE_ALERT_ENABLED=true,
+        SURPLUS_PRE_ALERT_PROBABILITY_FLOOR=0.72,
+        SURPLUS_PRE_ALERT_RADIUS_KM=16,
+        CORS_ALLOW_ORIGINS=${_FRONTEND_BASE_URL}
       - "--set-secrets"
-      - "FIREBASE_ADMIN_CREDENTIALS=FIREBASE_ADMIN_CREDENTIALS:latest,GOOGLE_APPLICATION_CREDENTIALS=GOOGLE_APPLICATION_CREDENTIALS:latest,TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN:latest"
+      - >-
+        OPENWEATHERMAP_API_KEY=OPENWEATHERMAP_API_KEY:latest,
+        TELEGRAM_MASTER_BOT_TOKEN=TELEGRAM_MASTER_BOT_TOKEN:latest,
+        TELEGRAM_MASTER_SECRET=TELEGRAM_MASTER_SECRET:latest
+
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: "gcloud"
+    args:
+      - "run"
+      - "deploy"
+      - "${_SERVICE_NAME_WEB}"
+      - "--image"
+      - "gcr.io/$PROJECT_ID/${_SERVICE_NAME_WEB}:$BUILD_ID"
+      - "--region"
+      - "${_REGION}"
+      - "--platform"
+      - "managed"
+      - "--allow-unauthenticated"
+      - "--memory"
+      - "1Gi"
+      - "--cpu"
+      - "1"
+      - "--min-instances"
+      - "0"
+      - "--max-instances"
+      - "10"
+      - "--set-env-vars"
+      - "NODE_ENV=production"
 
 images:
-  - "gcr.io/$PROJECT_ID/foodbridge-api:$COMMIT_SHA"
-  - "gcr.io/$PROJECT_ID/foodbridge-api:latest"
+  - "gcr.io/$PROJECT_ID/${_SERVICE_NAME_API}:$BUILD_ID"
+  - "gcr.io/$PROJECT_ID/${_SERVICE_NAME_WEB}:$BUILD_ID"
 
-timeout: "1200s"
+timeout: "2400s"

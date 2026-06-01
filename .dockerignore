@@ -1,0 +1,25 @@
+# Keep Cloud Run / Docker builds small (frontend + backend contexts use repo root)
+
+.git
+.github
+.cursor
+.claude
+.agents
+**/__pycache__
+**/.pytest_cache
+**/.venv
+**/venv
+**/node_modules
+**/.next
+**/dist
+**/*.log
+*.pem
+*.key
+backend/.venv
+foodbridge-*.json
+*firebase-adminsdk*.json
+google-application-credentials*.json
+
+# Do not send local secrets into build context (override with .env.production in deploy script)
+.env
+.env.local

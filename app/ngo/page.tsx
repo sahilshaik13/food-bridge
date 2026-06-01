@@ -4,6 +4,7 @@ import { RoleGuard } from "@/components/RoleGuard";
 import { AppNav } from "@/components/AppNav";
 import { DonationCard } from "@/components/DonationCard";
 import { PredictionPanel } from "@/components/PredictionPanel";
+import { ImpactStats } from "@/components/ImpactStats";
 import { useAuth } from "@/lib/AuthProvider";
 import { apiGet, apiSend } from "@/lib/api";
 import { useState, useEffect } from "react";
@@ -31,6 +32,7 @@ function NgoDashboard() {
   const [inviteLoading, setInviteLoading] = useState(false);
   const [inviteError, setInviteError] = useState("");
   const [apiError, setApiError] = useState<string | null>(null);
+  const [impact, setImpact] = useState<any>(null);
   const [volunteers, setVolunteers] = useState<any[]>([]);
   const [volunteerFilter, setVolunteerFilter] = useState<"all" | "invited" | "pending_approval" | "active" | "rejected">("all");
 
@@ -82,6 +84,15 @@ function NgoDashboard() {
     });
     return () => unsub();
   }, [profile?.entity_id]);
+
+  useEffect(() => {
+    const impactRef = ref(realtimeDatabase, "metrics/impact/global");
+    const unsub = onValue(impactRef, (snap) => {
+      const val = snap.val();
+      if (val) setImpact(val);
+    });
+    return () => unsub();
+  }, []);
 
   const handleInvite = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -171,6 +182,8 @@ function NgoDashboard() {
             </Link>
           </div>
         </div>
+
+        <ImpactStats impact={impact} />
 
         <div className="grid gap-8 lg:grid-cols-[1fr_340px]">
           {apiError && (

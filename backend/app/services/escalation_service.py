@@ -1,4 +1,7 @@
 from datetime import datetime, timedelta, timezone
+
+from google.api_core import exceptions as gcp_exceptions
+
 from app.core.config import get_settings
 from app.core.cloud_clients import get_cloud_tasks_client
 from app.models import Donation, DonationStatus, MatchScore, Notification, Role, CommunicationMessageCreate
@@ -18,6 +21,8 @@ ESCALATION_TIMERS_MINUTES = {
 }
 
 TASK_QUEUE_NAME = "foodbridge-escalation"
+
+_missing_tasks_queue_warned = False
 
 
 class EscalationService:
@@ -40,11 +45,13 @@ class EscalationService:
             self._execute_escalation(donation)
             return True
 
+        if not self.settings.escalation_cloud_tasks_enabled:
+            return True
+
         if self.tasks_client:
             return self._schedule_cloud_task(donation, timer_minutes)
-        else:
-            print(f"[ESCALATION] No Cloud Tasks client; relying on local due-check for {donation.id}")
-            return True
+        print(f"[ESCALATION] No Cloud Tasks client; relying on local due-check for {donation.id}")
+        return True
 
     def _schedule_cloud_task(self, donation: Donation, delay_minutes: int) -> bool:
         try:
@@ -76,6 +83,18 @@ class EscalationService:
             print(f"[ESCALATION] Scheduled Cloud Task for donation {donation.id} at level {donation.escalation_level}, delay={delay_minutes}min")
             return True
 
+        except gcp_exceptions.NotFound:
+            global _missing_tasks_queue_warned
+            if not _missing_tasks_queue_warned:
+                print(
+                    "[ESCALATION] Cloud Tasks queue "
+                    f"'{TASK_QUEUE_NAME}' not found in {self.settings.gcp_location} "
+                    "(404). Wave timers still use donation.wave_expires_at + local due-check. "
+                    "Create the queue in GCP or set ESCALATION_CLOUD_TASKS_ENABLED=false for local dev."
+                )
+                _missing_tasks_queue_warned = True
+            return True
+
         except Exception as e:
             print(f"[ESCALATION] Failed to schedule Cloud Task: {e}")
             return False
@@ -99,7 +118,6 @@ class EscalationService:
         active_states = {
             DonationStatus.pending_match,
             DonationStatus.notified,
-            DonationStatus.needs_review,
             DonationStatus.escalated_radius_2,
             DonationStatus.escalated_radius_3,
         }

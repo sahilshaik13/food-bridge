@@ -19,6 +19,7 @@ publisher = pubsub_v1.PublisherClient(credentials=get_google_credentials())
 topics = ["foodbridge-donations", "foodbridge-emergencies"]
 subscriptions = [
     ("foodbridge-donations", "foodbridge-donations-live-sub"),
+    ("foodbridge-donations", "foodbridge-donations-matching-sub"),
     ("foodbridge-emergencies", "foodbridge-emergencies-live-sub"),
 ]
 

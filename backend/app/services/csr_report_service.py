@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 import hashlib
@@ -13,14 +14,14 @@ from pathlib import Path
 
 from app.core.cloud_clients import get_firestore_client, get_gcp_storage_client
 from app.core.config import get_settings
+from app.core.latex_paths import get_latex_template_root
 from app.models import Donation
 from app.services.demo_store import store
 
 CSR_COLLECTION = "csr_reports"
 CSR_PREFIX = "reports/csr"
 _local_cache: dict[str, dict[str, Any]] = {}
-ROOT_DIR = Path(__file__).resolve().parents[3]
-CSR_TEMPLATE_PATH = ROOT_DIR / "csr.tex"
+CSR_TEMPLATE_PATH = get_latex_template_root() / "csr.tex"
 
 
 def _is_completed(donation: Donation) -> bool:
@@ -99,7 +100,29 @@ def build_csr_verify_url(report_id: str, donor_id: str, generated_at_iso: str) -
     return f"{base}/verify/csr/{report_id}?sig={sig}"
 
 
+def _normalize_for_pdflatex(value: str) -> str:
+    if not value:
+        return value
+    s = value
+    for u, rep in (
+        ("\u2264", "<="),
+        ("\u2265", ">="),
+        ("\u2026", "..."),
+        ("≤", "<="),
+        ("≥", ">="),
+        ("…", "..."),
+        ("\u2013", "-"),
+        ("\u2014", "-"),
+        ("–", "-"),
+        ("—", "-"),
+        ("\u00a0", " "),
+    ):
+        s = s.replace(u, rep)
+    return s
+
+
 def _latex_escape(value: str) -> str:
+    value = _normalize_for_pdflatex(str(value))
     replacements = {
         "\\": r"\textbackslash{}",
         "&": r"\&",
@@ -116,6 +139,68 @@ def _latex_escape(value: str) -> str:
     for k, v in replacements.items():
         out = out.replace(k, v)
     return out
+
+
+def _truncate_cell(s: str, max_len: int = 64) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= max_len else s[: max_len - 1] + "..."
+
+
+def _build_area_coverage_rows_latex(area_coverage: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for i, row in enumerate(area_coverage[:10], 1):
+        area = _truncate_cell(str(row.get("area", "—")), 48)
+        safe_area = _latex_escape(area)
+        count = int(row.get("completed_donations", 0))
+        lines.append(f"{i} & {safe_area} & {count} \\\\")
+    if not lines:
+        lines.append("— & No coverage data & — \\\\")
+    return " ".join(lines)
+
+
+def _build_food_breakdown_rows_latex(completed: list[Donation]) -> str:
+    kg_by: dict[str, float] = defaultdict(float)
+    meals_by: dict[str, int] = defaultdict(int)
+    for d in completed:
+        if d.items:
+            for it in d.items:
+                key = (it.food_type or "unspecified").strip() or "unspecified"
+                kg_by[key] += float(it.quantity_kg or 0)
+                meals_by[key] += int(it.meal_count or 0)
+        else:
+            key = (d.food_type or "unspecified").strip() or "unspecified"
+            kg_by[key] += float(d.quantity_kg or 0)
+            meals_by[key] += int(d.meal_count or 0)
+    ordered = sorted(kg_by.keys(), key=lambda k: kg_by[k], reverse=True)
+    lines: list[str] = []
+    for i, key in enumerate(ordered[:15], 1):
+        safe_name = _latex_escape(_truncate_cell(key, 56))
+        kg = round(kg_by[key], 2)
+        meals = int(meals_by[key])
+        lines.append(f"{i} & {safe_name} & {kg:g} & {meals} \\\\ \\hline")
+    if not lines:
+        lines.append("— & No food lines & — & — \\\\ \\hline")
+    return " ".join(lines)
+
+
+def _food_breakdown_records(completed: list[Donation]) -> list[dict[str, Any]]:
+    kg_by: dict[str, float] = defaultdict(float)
+    meals_by: dict[str, int] = defaultdict(int)
+    for d in completed:
+        if d.items:
+            for it in d.items:
+                key = (it.food_type or "unspecified").strip() or "unspecified"
+                kg_by[key] += float(it.quantity_kg or 0)
+                meals_by[key] += int(it.meal_count or 0)
+        else:
+            key = (d.food_type or "unspecified").strip() or "unspecified"
+            kg_by[key] += float(d.quantity_kg or 0)
+            meals_by[key] += int(d.meal_count or 0)
+    ordered = sorted(kg_by.keys(), key=lambda k: kg_by[k], reverse=True)
+    return [
+        {"food_category": k, "quantity_kg": round(kg_by[k], 2), "meal_count": int(meals_by[k])}
+        for k in ordered
+    ]
 
 
 def _replace_newcommand(tex: str, command: str, value: str) -> str:
@@ -203,6 +288,8 @@ def _render_pdf(metrics: dict[str, Any], report_id: str) -> bytes:
         "EmergencyContribCount": _latex_escape(str(metrics["emergency_contributions_count"])),
         "EmergencyKg": _latex_escape(str(metrics["emergency_contribution_kg"])),
         "EmergencyRequestsSupported": _latex_escape(str(metrics["emergency_requests_supported"])),
+        "AreaCoverageRows": metrics.get("area_coverage_rows_latex") or _build_area_coverage_rows_latex([]),
+        "FoodBreakdownRows": metrics.get("food_breakdown_rows_latex") or _build_food_breakdown_rows_latex([]),
     }
     for key, value in command_values.items():
         tex = _replace_newcommand(tex, key, value)
@@ -262,6 +349,9 @@ def generate_csr_report_for_donor(
         key=lambda x: x["completed_donations"],
         reverse=True,
     )
+    area_coverage_latex = _build_area_coverage_rows_latex(area_coverage)
+    food_breakdown_latex = _build_food_breakdown_rows_latex(completed)
+    food_breakdown_aggregate = _food_breakdown_records(completed)
 
     generated_at = datetime.now(timezone.utc)
     period_label = generated_at.strftime("%B %Y")
@@ -308,6 +398,9 @@ def generate_csr_report_for_donor(
         "area_coverage": area_coverage,
         "sdg_alignment": ["SDG 2", "SDG 12", "SDG 13"],
         "tax_note": "In-kind food donations are impact-tracked; this report does not claim 80G cash-deduction eligibility.",
+        "area_coverage_rows_latex": area_coverage_latex,
+        "food_breakdown_rows_latex": food_breakdown_latex,
+        "food_breakdown_aggregate": food_breakdown_aggregate,
     }
     path = f"{CSR_PREFIX}/{donor_id}/{report_id}.pdf"
     metrics["verify_signature"] = compute_csr_verify_signature(report_id, donor_id, metrics["generated_at"])
@@ -377,6 +470,9 @@ def generate_csr_report_preview_for_donor(
         key=lambda x: x["completed_donations"],
         reverse=True,
     )
+    area_coverage_latex = _build_area_coverage_rows_latex(area_coverage)
+    food_breakdown_latex = _build_food_breakdown_rows_latex(completed)
+    food_breakdown_aggregate = _food_breakdown_records(completed)
 
     generated_at = datetime.now(timezone.utc)
     period_label = generated_at.strftime("%B %Y")
@@ -410,6 +506,9 @@ def generate_csr_report_preview_for_donor(
         "area_coverage": area_coverage,
         "sdg_alignment": ["SDG 2", "SDG 12", "SDG 13"],
         "tax_note": "In-kind food donations are impact-tracked; this report does not claim 80G cash-deduction eligibility.",
+        "area_coverage_rows_latex": area_coverage_latex,
+        "food_breakdown_rows_latex": food_breakdown_latex,
+        "food_breakdown_aggregate": food_breakdown_aggregate,
     }
     metrics["verify_signature"] = compute_csr_verify_signature(report_id, donor_id, metrics["generated_at"])
     metrics["verify_url"] = build_csr_verify_url(report_id, donor_id, metrics["generated_at"])

@@ -19,8 +19,8 @@ export function ImpactStats({ impact }: { impact: ImpactStatsType | null | undef
 
   const stats = [
     { label: "Meals served", value: (impact.meals_served || 0).toLocaleString("en-IN"), icon: Utensils },
-    { label: "Food saved", value: `${((impact.kg_saved || 0) / 1000).toFixed(1)} t`, icon: Leaf },
-    { label: "CO₂ offset", value: `${((impact.co2_offset_kg || 0) / 1000).toFixed(1)} t`, icon: BadgeIndianRupee }
+    { label: "Food saved (kg)", value: Number(impact.kg_saved || 0).toLocaleString("en-IN", { maximumFractionDigits: 1 }), icon: Leaf },
+    { label: "CO₂ offset (kg)", value: Number(impact.co2_offset_kg || 0).toLocaleString("en-IN", { maximumFractionDigits: 1 }), icon: BadgeIndianRupee }
   ];
 
   return (

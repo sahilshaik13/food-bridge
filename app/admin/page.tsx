@@ -4,10 +4,11 @@ import { RoleGuard } from "@/components/RoleGuard";
 import { AppNav } from "@/components/AppNav";
 import { AdminUsersPanel } from "@/components/AdminUsersPanel";
 import { useAuth } from "@/lib/AuthProvider";
-import { apiGet } from "@/lib/api";
+import { apiGet, apiSend } from "@/lib/api";
 import { useState, useEffect } from "react";
 import { Users, Package, AlertTriangle, CheckCircle2, BarChart3 } from "lucide-react";
 import { HeatMapPanel } from "@/components/HeatMapPanel";
+import { EntityNameTables } from "@/components/EntityNameTables";
 import { realtimeDatabase } from "@/lib/firebase";
 import { onValue, ref } from "firebase/database";
 
@@ -24,29 +25,37 @@ function AdminDashboard() {
   const [stats, setStats] = useState<any>(null);
   const [flagged, setFlagged] = useState<any[]>([]);
   const [emergencyHistory, setEmergencyHistory] = useState<any[]>([]);
+  const [directory, setDirectory] = useState<{ donors: any[]; ngos: any[]; volunteers: any[] }>({
+    donors: [],
+    ngos: [],
+    volunteers: [],
+  });
   const [error, setError] = useState<string | null>(null);
 
+  const loadAdminData = async () => {
+    setError(null);
+    try {
+      const [impact, donations] = await Promise.all([
+        apiGet<any>("/impact"),
+        apiGet<any[]>("/donations"),
+      ]);
+      setStats(impact);
+      setFlagged(donations.filter((d) => d.status === "needs_review"));
+    } catch {
+      setError("Backend request failed. Admin data is not loaded.");
+      setStats(null);
+      setFlagged([]);
+    }
+  };
+
   useEffect(() => {
-    const run = async () => {
-      setError(null);
-      try {
-        const [impact, donations] = await Promise.all([
-          apiGet<any>("/impact"),
-          apiGet<any[]>("/donations"),
-        ]);
-        setStats(impact);
-        setFlagged(donations.filter((d) => d.status === "needs_review"));
-      } catch {
-        setError("Backend request failed. Admin data is not loaded.");
-        setStats(null);
-        setFlagged([]);
-      }
-    };
-    run();
+    loadAdminData();
   }, []);
 
   useEffect(() => {
     const historyRef = ref(realtimeDatabase, "history_feeds/emergency/admin");
+    const impactRef = ref(realtimeDatabase, "metrics/impact/global");
+    const directoryRef = ref(realtimeDatabase, "directory/entities");
     const unsub = onValue(historyRef, (snap) => {
       const val = snap.val() || {};
       const list = Object.values(val as Record<string, any>).sort((a: any, b: any) =>
@@ -54,7 +63,23 @@ function AdminDashboard() {
       );
       setEmergencyHistory(list);
     });
-    return () => unsub();
+    const unsubImpact = onValue(impactRef, (snap) => {
+      const val = snap.val();
+      if (val) setStats(val);
+    });
+    const unsubDirectory = onValue(directoryRef, (snap) => {
+      const val = snap.val() || {};
+      setDirectory({
+        donors: Object.values(val.donors || {}),
+        ngos: Object.values(val.ngos || {}),
+        volunteers: Object.values(val.volunteers || {}),
+      });
+    });
+    return () => {
+      unsub();
+      unsubImpact();
+      unsubDirectory();
+    };
   }, []);
 
   return (
@@ -102,8 +127,34 @@ function AdminDashboard() {
                     <p className="text-xs text-ink/50">{d.scan?.reason}</p>
                   </div>
                   <div className="flex gap-2">
-                    <button className="rounded-lg bg-leaf/10 px-3 py-1.5 text-xs font-bold text-leaf hover:bg-leaf hover:text-white">Approve</button>
-                    <button className="rounded-lg bg-chili/10 px-3 py-1.5 text-xs font-bold text-chili hover:bg-chili hover:text-white">Reject</button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          await apiSend(`/donations/${d.id}/admin/approve`, {}, "POST");
+                          await loadAdminData();
+                        } catch {
+                          setError("Approve failed. Check role claim is super_admin.");
+                        }
+                      }}
+                      className="rounded-lg bg-leaf/10 px-3 py-1.5 text-xs font-bold text-leaf hover:bg-leaf hover:text-white"
+                    >
+                      Approve
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          await apiSend(`/donations/${d.id}/admin/reject`, {}, "POST");
+                          await loadAdminData();
+                        } catch {
+                          setError("Reject failed. Check role claim is super_admin.");
+                        }
+                      }}
+                      className="rounded-lg bg-chili/10 px-3 py-1.5 text-xs font-bold text-chili hover:bg-chili hover:text-white"
+                    >
+                      Reject
+                    </button>
                   </div>
                 </div>
               ))}
@@ -124,6 +175,11 @@ function AdminDashboard() {
             </div>
           </div>
         )}
+
+        <div className="mb-8">
+          <h2 className="mb-4 text-xl font-bold text-ink">Entity Directory (Realtime)</h2>
+          <EntityNameTables donors={directory.donors} ngos={directory.ngos} volunteers={directory.volunteers} />
+        </div>
 
 
         {/* User verification */}

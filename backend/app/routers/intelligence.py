@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Header
 
 from app.models import (
     EmergencyContributionCreate,
@@ -13,6 +13,9 @@ from app.models import (
 from app.services.demo_store import store
 from app.services.auth_service import verify_firebase_token, get_current_user_role
 from app.services.time_scale import logical_minutes_from_timedelta
+from app.services.surplus_prediction_service import run_surplus_pre_alert_job
+from app.services.heatmap_service import build_heatmap_payload
+from app.core.config import get_settings
 
 router = APIRouter(tags=["intelligence"])
 
@@ -25,6 +28,22 @@ def get_impact() -> ImpactStats:
 @router.get("/predictions/surplus", response_model=list[Prediction])
 def get_predictions() -> list[Prediction]:
     return store.predictions()
+
+
+@router.post("/jobs/surplus-pre-alert")
+def job_surplus_pre_alert(
+    x_foodbridge_job_secret: str | None = Header(None, alias="X-FoodBridge-Job-Secret"),
+) -> dict:
+    """
+    Cloud Scheduler / cron: NGO pre-alert batch using surplus predictions.
+    Set SCHEDULER_JOB_SECRET in prod and send the same value in header X-FoodBridge-Job-Secret.
+    When unset (local dev), the endpoint is open — lock down in deployment.
+    """
+    settings = get_settings()
+    expected = settings.scheduler_job_secret
+    if expected and x_foodbridge_job_secret != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing job secret")
+    return run_surplus_pre_alert_job(store)
 
 
 @router.post("/emergency-requests", response_model=EmergencyRequest)
@@ -125,28 +144,7 @@ def resolve_emergency_request(
 
 @router.get("/heatmap/data")
 def get_heatmap_data() -> dict:
-    surplus_features = [
-        {
-            "type": "Feature",
-            "properties": {"kind": "surplus", "weight": donor.monthly_meals, "name": donor.name},
-            "geometry": {"type": "Point", "coordinates": [donor.location.lng, donor.location.lat]},
-        }
-        for donor in store.donors.values()
-    ]
-    demand_features = [
-        {
-            "type": "Feature",
-            "properties": {"kind": "demand", "weight": ngo.beneficiary_count, "name": ngo.name},
-            "geometry": {"type": "Point", "coordinates": [ngo.location.lng, ngo.location.lat]},
-        }
-        for ngo in store.ngos.values()
-    ]
-    return {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "surplus": {"type": "FeatureCollection", "features": surplus_features},
-        "demand": {"type": "FeatureCollection", "features": demand_features},
-        "coverage_gaps": [
-            {"area": "Old City", "severity": "high", "reason": "High demand, thin recurring donor density"},
-            {"area": "Secunderabad", "severity": "medium", "reason": "Night shelter demand peaks after 9pm"},
-        ],
-    }
+    """
+    GeoJSON surplus/demand pins + computed coverage-gap points (PRD municipal heatmap).
+    """
+    return build_heatmap_payload(store)

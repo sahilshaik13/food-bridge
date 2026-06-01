@@ -1,13 +1,55 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from typing import List, Dict, Any
 
 from app.models import Donation, DonationCreate, DonationStatus, DonationStatusUpdate, UserProfile, VolunteerTaskStatus
-from app.services.demo_store import store
-from app.services.auth_service import verify_firebase_token, get_current_user_role
+from app.services.demo_store import coerce_legacy_donation_payload, store
+from app.services.auth_service import verify_firebase_token, get_current_user_role, require_role
 from app.services.escalation_service import escalation_service
 from app.core.cloud_clients import get_firestore_client
+from app.core.config import get_settings
 
 router = APIRouter(prefix="/donations", tags=["donations"])
+
+
+async def _donation_payload_and_image(request: Request) -> tuple[DonationCreate, bytes | None]:
+    """
+    Multipart: form field `payload` = JSON string (DonationCreate), optional/required `photo` file.
+    JSON body: only allowed when REQUIRE_DONATION_PHOTO_FOR_HTTP=false (text-only Gemini path).
+    """
+    settings = get_settings()
+    ct = request.headers.get("content-type") or ""
+    if "multipart/form-data" in ct.lower():
+        form = await request.form()
+        raw = form.get("payload")
+        if raw is None or not isinstance(raw, str):
+            raise HTTPException(
+                status_code=422,
+                detail="Multipart body must include form field 'payload' (JSON string of DonationCreate fields).",
+            )
+        payload = DonationCreate.model_validate_json(raw)
+        photo = form.get("photo")
+        image_bytes: bytes | None = None
+        if photo is not None and hasattr(photo, "read"):
+            image_bytes = await photo.read()
+        if settings.require_donation_photo_for_http:
+            if not image_bytes or len(image_bytes) < 64:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Food photo is required: include a non-empty form field 'photo' (JPEG/PNG/WebP).",
+                )
+        return payload, image_bytes
+
+    body = await request.json()
+    payload = DonationCreate(**body)
+    if settings.require_donation_photo_for_http:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Submit donations as multipart/form-data with 'payload' (JSON) and 'photo' (food image) "
+                "so Gemini Vision can scan the meal. For JSON-only dev/testing, set REQUIRE_DONATION_PHOTO_FOR_HTTP=false."
+            ),
+        )
+    return payload, None
 
 
 def _has_completion_signal(item: Donation) -> bool:
@@ -24,7 +66,16 @@ def _normalize_effective_status(item: Donation) -> None:
         item.status = item.status.__class__("completed")
 
 
-@router.get("", response_model=list[Donation])
+@router.get(
+    "",
+    response_model=list[Donation],
+    summary="List donations",
+    description=(
+        "Returns donations visible to the caller. Each item includes **Phase 2** `scan` metadata "
+        "(`model_id`, `model_version`, `generated_at`, `fallback_used`), optional `accuracy`, and "
+        "`scan_contract_version` (1 = legacy lineage, 2 = full model lineage on scan)."
+    ),
+)
 def list_donations(decoded_token: dict = Depends(verify_firebase_token)) -> list[Donation]:
     escalation_service.process_due_escalations()
     uid = decoded_token.get("uid")
@@ -74,8 +125,18 @@ def list_donations(decoded_token: dict = Depends(verify_firebase_token)) -> list
     return sorted(donations, key=lambda item: item.created_at, reverse=True)
 
 
-@router.post("", response_model=Donation)
-def create_donation(payload: DonationCreate, decoded_token: dict = Depends(verify_firebase_token)) -> Donation:
+@router.post(
+    "",
+    response_model=Donation,
+    summary="Create donation",
+    description=(
+        "Creates a donation; uses Gemini Vision when multipart includes `photo`. "
+        "Send **multipart/form-data**: field `payload` = JSON string (`DonationCreate`), field `photo` = image bytes. "
+        "When `REQUIRE_DONATION_PHOTO_FOR_HTTP` is false, accepts legacy JSON body without image (text-only scan)."
+    ),
+)
+async def create_donation(request: Request, decoded_token: dict = Depends(verify_firebase_token)) -> Donation:
+    payload, image_bytes = await _donation_payload_and_image(request)
     uid = decoded_token.get("uid")
     user = store.users.get(uid)
     donor_id = payload.donor_id
@@ -85,10 +146,79 @@ def create_donation(payload: DonationCreate, decoded_token: dict = Depends(verif
     payload = DonationCreate(**{**payload.model_dump(), "donor_id": donor_id})
     if payload.donor_id not in store.donors:
         raise HTTPException(status_code=404, detail="Unknown donor")
-    return store.create_donation(payload)
+    return store.create_donation(payload, image_bytes=image_bytes)
 
 
-@router.get("/{donation_id}", response_model=Donation)
+@router.patch(
+    "/{donation_id}/retry-scan",
+    response_model=Donation,
+    summary="Retry Gemini scan",
+    description=(
+        "Donor-only: second attempt after `pending_scan_retry`. "
+        "Same multipart rules as POST /donations (payload + photo when photo requirement is enabled)."
+    ),
+)
+async def retry_donation_scan_endpoint(
+    donation_id: str,
+    request: Request,
+    decoded_token: dict = Depends(verify_firebase_token),
+) -> Donation:
+    payload, image_bytes = await _donation_payload_and_image(request)
+    uid = decoded_token.get("uid")
+    user = store.users.get(uid)
+    donor_id = payload.donor_id
+    if user and user.entity_id:
+        donor_id = user.entity_id
+    payload = DonationCreate(**{**payload.model_dump(), "donor_id": donor_id})
+    role = get_current_user_role(decoded_token)
+    if role is None or role.value != "donor":
+        raise HTTPException(status_code=403, detail="Only donors can retry scan")
+    if donation_id not in store.donations:
+        raise HTTPException(status_code=404, detail="Donation not found")
+    if store.donations[donation_id].donor_id != donor_id:
+        raise HTTPException(status_code=403, detail="Donor can only retry own donations")
+    try:
+        return store.retry_donation_scan(donation_id, payload, image_bytes=image_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post(
+    "/{donation_id}/admin/approve",
+    response_model=Donation,
+    summary="Super Admin: approve reviewed donation",
+)
+def admin_approve_reviewed_donation(
+    donation_id: str,
+    _claims: dict = Depends(require_role("super_admin")),
+) -> Donation:
+    try:
+        return store.admin_resolve_scan_review(donation_id, approved=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post(
+    "/{donation_id}/admin/reject",
+    response_model=Donation,
+    summary="Super Admin: reject reviewed donation",
+)
+def admin_reject_reviewed_donation(
+    donation_id: str,
+    _claims: dict = Depends(require_role("super_admin")),
+) -> Donation:
+    try:
+        return store.admin_resolve_scan_review(donation_id, approved=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get(
+    "/{donation_id}",
+    response_model=Donation,
+    summary="Get donation by id",
+    description="Full donation record including `scan`, optional `accuracy`, and `scan_contract_version`.",
+)
 def get_donation(donation_id: str) -> Donation:
     escalation_service.process_due_escalations()
     if donation_id not in store.donations:
@@ -98,7 +228,12 @@ def get_donation(donation_id: str) -> Donation:
     return donation
 
 
-@router.patch("/{donation_id}/status", response_model=Donation)
+@router.patch(
+    "/{donation_id}/status",
+    response_model=Donation,
+    summary="Update donation status",
+    description="Workflow transitions; returned `Donation` retains Phase 2 `scan` / `accuracy` / `scan_contract_version` fields.",
+)
 def update_status(
     donation_id: str,
     payload: DonationStatusUpdate,
@@ -111,6 +246,9 @@ def update_status(
             data = doc.to_dict() or {}
             if data:
                 from app.models import MatchScore
+                if not data.get("id"):
+                    data["id"] = donation_id
+                data = coerce_legacy_donation_payload(data)
                 data["ngo_queue"] = [MatchScore(**q) for q in data.get("ngo_queue", [])]
                 latest = Donation(**data)
                 store.donations[donation_id] = latest

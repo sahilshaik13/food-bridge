@@ -1,6 +1,7 @@
 export type DonationStatus =
   | "draft"
   | "pending_match"
+  | "pending_scan_retry"
   | "notified"
   | "accepted"
   | "declined"
@@ -71,6 +72,8 @@ export type Prediction = {
   predicted_time: string;
   probability: number;
   nearby_ngos: number;
+  /** heuristic | bigquery_aggregate | blended — optional for older mock payloads */
+  source?: "heuristic" | "bigquery_aggregate" | "blended";
 };
 
 export type Notification = {

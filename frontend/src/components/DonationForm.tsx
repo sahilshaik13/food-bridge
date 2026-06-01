@@ -3,8 +3,8 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import { useAuth } from "@/lib/AuthProvider";
-import { apiSend, apiGet } from "@/lib/api";
-import { Camera, Send, Loader2, CheckCircle2, AlertCircle, MapPin, Clock, RadioTower } from "lucide-react";
+import { apiSendForm, apiGet } from "@/lib/api";
+import { Camera, Send, Loader2, CheckCircle2, AlertCircle, MapPin, Clock, RadioTower, Thermometer } from "lucide-react";
 import { MapViewer } from "./MapViewer";
 
 interface BroadcastedNgo {
@@ -20,12 +20,30 @@ export function DonationForm({ onSuccess, mode = "standalone" }: { onSuccess?: (
   const [loading, setLoading] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [donationId, setDonationId] = useState<string | null>(null);
+  const [pendingRetryId, setPendingRetryId] = useState<string | null>(null);
+  const [reviewHold, setReviewHold] = useState(false);
   const [scanResult, setScanResult] = useState<any>(null);
   const [broadcastedNgos, setBroadcastedNgos] = useState<BroadcastedNgo[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [photoFile, setPhotoFile] = useState<File | null>(null);
+  const [photoPreviewUrl, setPhotoPreviewUrl] = useState<string | null>(null);
   const [items, setItems] = useState<Array<{ food_type: string; quantity: string; meals: string }>>([
     { food_type: "", quantity: "", meals: "" },
   ]);
+  const [foodPreparedLocal, setFoodPreparedLocal] = useState("");
+  const [roomTemp, setRoomTemp] = useState("");
+  const [fridge, setFridge] = useState<"unknown" | "yes" | "no">("unknown");
+  const [opNotes, setOpNotes] = useState("");
+
+  useEffect(() => {
+    if (!photoFile) {
+      setPhotoPreviewUrl(null);
+      return;
+    }
+    const url = URL.createObjectURL(photoFile);
+    setPhotoPreviewUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [photoFile]);
 
   useEffect(() => {
     if (mode === "standalone" && submitted && donationId) {
@@ -39,8 +57,15 @@ export function DonationForm({ onSuccess, mode = "standalone" }: { onSuccess?: (
       setSubmitted(false);
       setScanResult(null);
       setDonationId(null);
+      setPendingRetryId(null);
+      setReviewHold(false);
       setBroadcastedNgos([]);
       setError(null);
+      setPhotoFile(null);
+      setFoodPreparedLocal("");
+      setRoomTemp("");
+      setFridge("unknown");
+      setOpNotes("");
     }, 5000);
     return () => clearTimeout(timer);
   }, [mode, submitted]);
@@ -67,7 +92,13 @@ export function DonationForm({ onSuccess, mode = "standalone" }: { onSuccess?: (
       setLoading(false);
       return;
     }
-    const payload = {
+    if (!photoFile) {
+      setError("Please add a clear photo of the surplus food so Gemini Vision can verify it.");
+      setLoading(false);
+      return;
+    }
+
+    const payload: Record<string, unknown> = {
       donor_id: profile?.id || profile?.entity_id || "donor_unknown",
       donor_name: profile?.name || profile?.display_name || "Unknown",
       food_type: normalizedItems[0].food_type,
@@ -78,14 +109,39 @@ export function DonationForm({ onSuccess, mode = "standalone" }: { onSuccess?: (
       source: "web",
     };
 
+    if (foodPreparedLocal.trim()) {
+      const d = new Date(foodPreparedLocal);
+      if (!Number.isNaN(d.getTime())) payload.food_prepared_at = d.toISOString();
+    }
+    const rt = parseFloat(roomTemp);
+    if (roomTemp.trim() !== "" && !Number.isNaN(rt)) payload.storage_ambient_temp_c = rt;
+    if (fridge === "yes") payload.held_in_refrigeration = true;
+    if (fridge === "no") payload.held_in_refrigeration = false;
+    if (opNotes.trim()) payload.operational_metrics_notes = opNotes.trim();
+
     try {
-      const result: any = await apiSend("/donations", payload);
+      const path = pendingRetryId ? `/donations/${pendingRetryId}/retry-scan` : "/donations";
+      const method = pendingRetryId ? "PATCH" : "POST";
+      const formData = new FormData();
+      formData.append("payload", JSON.stringify(payload));
+      formData.append("photo", photoFile);
+      const result: any = await apiSendForm(path, formData, method);
       setDonationId(result.id);
       setScanResult(result.scan);
-      if (result.scan?.passed !== false) {
-        setSubmitted(true);
-        onSuccess?.();
+      if (result.status === "pending_scan_retry") {
+        setPendingRetryId(result.id);
+        setReviewHold(false);
+        return;
       }
+      if (result.status === "needs_review") {
+        setPendingRetryId(null);
+        setReviewHold(true);
+        return;
+      }
+      setPendingRetryId(null);
+      setReviewHold(false);
+      setSubmitted(true);
+      onSuccess?.();
     } catch (err: any) {
       setError(err.message || "Failed to post donation.");
     } finally {
@@ -107,7 +163,7 @@ export function DonationForm({ onSuccess, mode = "standalone" }: { onSuccess?: (
         <CheckCircle2 className="mx-auto size-12 text-leaf" />
         <h3 className="mt-4 text-xl font-bold text-ink">Donation Posted!</h3>
         <p className="mt-2 text-sm text-ink/60">
-          Gemini verified the food. Nearby NGOs have been notified.
+          Gemini Vision verified your photo. Nearby NGOs have been notified.
           {scanResult && (
             <span className="mt-1 block font-bold text-leaf">
               {Math.round(scanResult.confidence * 100)}% freshness confidence
@@ -163,7 +219,14 @@ export function DonationForm({ onSuccess, mode = "standalone" }: { onSuccess?: (
             setSubmitted(false);
             setScanResult(null);
             setDonationId(null);
+            setPendingRetryId(null);
+            setReviewHold(false);
             setBroadcastedNgos([]);
+            setPhotoFile(null);
+            setFoodPreparedLocal("");
+            setRoomTemp("");
+            setFridge("unknown");
+            setOpNotes("");
           }}
           className="w-full rounded-xl bg-ink py-3.5 font-bold text-white shadow-line hover:bg-ink/90"
         >
@@ -178,6 +241,37 @@ export function DonationForm({ onSuccess, mode = "standalone" }: { onSuccess?: (
       )}
     </div>
   );
+
+  if (reviewHold) {
+    return (
+      <div className="space-y-4 rounded-2xl border border-amber-200 bg-amber-50 p-6 shadow-lift">
+        <div className="flex items-start gap-2">
+          <AlertCircle className="mt-0.5 size-5 shrink-0 text-amber-700" />
+          <div>
+            <p className="font-bold text-amber-900">Queued for Super Admin review</p>
+            <p className="mt-1 text-sm text-amber-900/80">
+              Gemini could not safely auto-verify this listing after your attempts. Our team will clear or reject it — check your donor dashboard for updates.
+            </p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => {
+            setReviewHold(false);
+            setScanResult(null);
+            setDonationId(null);
+            setPhotoFile(null);
+          }}
+          className="w-full rounded-xl bg-ink py-3 text-sm font-bold text-white shadow-line hover:bg-ink/90"
+        >
+          Start a new listing
+        </button>
+        <Link href="/donor" className="inline-flex w-full items-center justify-center rounded-xl border border-ink/15 bg-white py-3 text-sm font-bold text-ink hover:bg-field">
+          Back to dashboard
+        </Link>
+      </div>
+    );
+  }
 
   return (
     <form onSubmit={handleSubmit} className="rounded-2xl border border-ink/10 bg-white p-6 shadow-lift">
@@ -255,19 +349,108 @@ export function DonationForm({ onSuccess, mode = "standalone" }: { onSuccess?: (
           ))}
         </div>
 
+        <div className="grid gap-2">
+          <label className="grid gap-1.5 text-xs font-bold uppercase tracking-widest text-ink/50">
+            Food photo (required)
+            <input
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              capture="environment"
+              onChange={(e) => setPhotoFile(e.target.files?.[0] ?? null)}
+              className="text-sm file:mr-3 file:rounded-lg file:border-0 file:bg-leaf/15 file:px-3 file:py-2 file:text-xs file:font-bold file:text-leaf"
+            />
+          </label>
+          {photoPreviewUrl && (
+            <div className="overflow-hidden rounded-xl border border-ink/10 bg-field/50">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={photoPreviewUrl} alt="Food preview" className="max-h-48 w-full object-cover" />
+            </div>
+          )}
+          <p className="text-[11px] leading-snug text-ink/50">
+            Each listing is scanned with Gemini Vision on this photo before NGOs are notified.
+          </p>
+        </div>
+
         <label className="grid gap-1.5 text-xs font-bold uppercase tracking-widest text-ink/50">
           Notes (optional)
           <textarea name="notes" rows={2} placeholder="Packed in containers, ready for pickup now."
             className="rounded-xl border border-ink/15 bg-paper px-4 py-2.5 text-sm font-normal outline-none focus:border-leaf" />
         </label>
 
+        <details className="rounded-xl border border-ink/10 bg-field/40 p-4">
+          <summary className="cursor-pointer list-none font-bold text-sm text-ink [&::-webkit-details-marker]:hidden flex items-center gap-2">
+            <Thermometer className="size-4 text-civic shrink-0" />
+            Optional kitchen &amp; storage details
+            <span className="ml-auto text-[10px] font-normal uppercase tracking-widest text-ink/45">helps AI routing</span>
+          </summary>
+          <p className="mt-3 text-[11px] leading-snug text-ink/55">
+            Many kitchens cannot measure everything — leave blank if unknown. When provided, these signals improve accuracy scoring together with weather near your venue.
+          </p>
+          <div className="mt-4 grid gap-3">
+            <label className="grid gap-1 text-[11px] font-bold uppercase tracking-widest text-ink/45">
+              Food prepared (local time)
+              <input
+                type="datetime-local"
+                value={foodPreparedLocal}
+                onChange={(e) => setFoodPreparedLocal(e.target.value)}
+                className="rounded-xl border border-ink/15 bg-paper px-4 py-2.5 text-sm font-normal outline-none focus:border-leaf"
+              />
+            </label>
+            <label className="grid gap-1 text-[11px] font-bold uppercase tracking-widest text-ink/45">
+              Room / storage temperature (°C)
+              <input
+                type="number"
+                step="0.5"
+                value={roomTemp}
+                onChange={(e) => setRoomTemp(e.target.value)}
+                placeholder="e.g. 24"
+                className="rounded-xl border border-ink/15 bg-paper px-4 py-2.5 text-sm font-normal outline-none focus:border-leaf"
+              />
+            </label>
+            <label className="grid gap-1 text-[11px] font-bold uppercase tracking-widest text-ink/45">
+              Held under refrigeration?
+              <select
+                value={fridge}
+                onChange={(e) => setFridge(e.target.value as "unknown" | "yes" | "no")}
+                className="rounded-xl border border-ink/15 bg-paper px-4 py-2.5 text-sm font-normal outline-none focus:border-leaf"
+              >
+                <option value="unknown">Unknown / not sure</option>
+                <option value="yes">Yes</option>
+                <option value="no">No</option>
+              </select>
+            </label>
+            <label className="grid gap-1 text-[11px] font-bold uppercase tracking-widest text-ink/45">
+              Handling notes
+              <textarea
+                rows={2}
+                value={opNotes}
+                onChange={(e) => setOpNotes(e.target.value)}
+                placeholder="e.g. Blast chilled after service, held in walk-in until pickup."
+                className="rounded-xl border border-ink/15 bg-paper px-4 py-2.5 text-sm font-normal outline-none focus:border-leaf"
+              />
+            </label>
+          </div>
+        </details>
+
+        {pendingRetryId && (
+          <div className="flex items-start gap-2 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm">
+            <AlertCircle className="mt-0.5 size-4 shrink-0 text-amber-800" />
+            <div>
+              <p className="font-bold text-amber-900">First scan inconclusive — one retry left</p>
+              <p className="text-xs text-amber-900/85">
+                Adjust food details or notes, then submit again. A second failure sends this to Super Admin review before NGOs see it.
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* Scan result feedback */}
         {scanResult && !scanResult.passed && (
           <div className="flex items-start gap-2 rounded-xl bg-chili/10 p-3 text-sm">
             <AlertCircle className="mt-0.5 size-4 shrink-0 text-chili" />
             <div>
-              <p className="font-bold text-chili">Scan Failed — {Math.round(scanResult.confidence * 100)}% confidence</p>
-              <p className="text-xs text-chili/80">{scanResult.reason}. Please try resubmitting with better details.</p>
+              <p className="font-bold text-chili">Scan uncertain — {Math.round(scanResult.confidence * 100)}% confidence</p>
+              <p className="text-xs text-chili/80">{scanResult.reason}</p>
             </div>
           </div>
         )}
@@ -281,7 +464,11 @@ export function DonationForm({ onSuccess, mode = "standalone" }: { onSuccess?: (
         <button disabled={loading}
           className="flex items-center justify-center gap-2 rounded-xl bg-leaf py-3.5 font-bold text-white shadow-line hover:bg-ink disabled:opacity-50">
           {loading ? <Loader2 className="size-5 animate-spin" /> : <Send className="size-5" />}
-          {loading ? "Scanning & Broadcasting…" : "Broadcast to NGOs"}
+          {loading
+            ? "Scanning & Broadcasting…"
+            : pendingRetryId
+              ? "Retry scan & broadcast"
+              : "Broadcast to NGOs"}
         </button>
       </div>
     </form>

@@ -3,12 +3,20 @@
 import { RoleGuard } from "@/components/RoleGuard";
 import { AppNav } from "@/components/AppNav";
 import { HeatMapPanel } from "@/components/HeatMapPanel";
+import { ImpactStats } from "@/components/ImpactStats";
+import { EntityNameTables } from "@/components/EntityNameTables";
 import { realtimeDatabase } from "@/lib/firebase";
 import { onValue, ref } from "firebase/database";
 import { useEffect, useState } from "react";
 
 export default function MunicipalPage() {
   const [emergencyHistory, setEmergencyHistory] = useState<any[]>([]);
+  const [impact, setImpact] = useState<any>(null);
+  const [directory, setDirectory] = useState<{ donors: any[]; ngos: any[]; volunteers: any[] }>({
+    donors: [],
+    ngos: [],
+    volunteers: [],
+  });
 
   useEffect(() => {
     const historyRef = ref(realtimeDatabase, "history_feeds/emergency/municipal");
@@ -22,6 +30,28 @@ export default function MunicipalPage() {
     return () => unsub();
   }, []);
 
+  useEffect(() => {
+    const impactRef = ref(realtimeDatabase, "metrics/impact/global");
+    const unsub = onValue(impactRef, (snap) => {
+      const val = snap.val();
+      if (val) setImpact(val);
+    });
+    return () => unsub();
+  }, []);
+
+  useEffect(() => {
+    const directoryRef = ref(realtimeDatabase, "directory/entities");
+    const unsub = onValue(directoryRef, (snap) => {
+      const val = snap.val() || {};
+      setDirectory({
+        donors: Object.values(val.donors || {}),
+        ngos: Object.values(val.ngos || {}),
+        volunteers: Object.values(val.volunteers || {}),
+      });
+    });
+    return () => unsub();
+  }, []);
+
   return (
     <RoleGuard allowedRoles={["municipal_admin", "super_admin"]}>
       <div className="min-h-screen bg-paper/30">
@@ -31,6 +61,11 @@ export default function MunicipalPage() {
             <p className="text-[10px] font-bold uppercase tracking-widest text-ink/40">Municipal Dashboard</p>
             <h1 className="text-3xl font-bold text-ink">Surplus Heatmap & Compliance</h1>
             <p className="mt-1 text-sm text-ink/60">Live city-wide visibility of food redistribution activity and coverage gaps.</p>
+          </div>
+          <ImpactStats impact={impact} />
+          <div className="my-6">
+            <h2 className="mb-3 text-lg font-bold text-ink">Entity Directory (Realtime)</h2>
+            <EntityNameTables donors={directory.donors} ngos={directory.ngos} volunteers={directory.volunteers} />
           </div>
           {emergencyHistory.length > 0 && (
             <div className="mb-6 rounded-2xl border border-ink/10 bg-white p-5 shadow-lift">

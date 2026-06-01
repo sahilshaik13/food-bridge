@@ -77,6 +77,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setProfile(data.profile);
         setRedirectTo(data.redirect_to);
       } else {
+        const errorText = await response.text();
+        console.error("Profile refresh /auth/verify failed:", response.status, errorText);
         setRole(null);
         setProfile(null);
         setRedirectTo(null);
@@ -117,6 +119,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             setProfile(data.profile);
             setRedirectTo(data.redirect_to);
           } else {
+            const errorText = await response.text();
+            console.error("Auth verification /auth/verify failed:", response.status, errorText);
             setRole(null);
             setProfile(null);
             setRedirectTo(null);

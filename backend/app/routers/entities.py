@@ -14,6 +14,30 @@ def slugify(text: str) -> str:
     return text.strip("-")
 
 
+def normalize_public_slug(raw: str) -> str:
+    """Align URL segments like donor_barbeque_nation with slugify('Barbeque Nation') -> barbeque-nation."""
+    s = raw.strip().lower()
+    if s.startswith("donor_"):
+        s = s[6:]
+    return s.replace("_", "-")
+
+
+def donor_matches_public_slug(donor: Donor, id_or_slug: str) -> bool:
+    name_slug = slugify(donor.name)
+    path_norm = normalize_public_slug(id_or_slug)
+    if donor.id == id_or_slug:
+        return True
+    if donor.id.lower() == id_or_slug.strip().lower():
+        return True
+    if name_slug == id_or_slug.strip().lower():
+        return True
+    if name_slug == path_norm:
+        return True
+    if donor.id.lower().replace("_", "-") == path_norm:
+        return True
+    return False
+
+
 @router.get("/donors", response_model=list[Donor])
 def list_donors() -> list[Donor]:
     return list(store.donors.values())
@@ -209,7 +233,7 @@ def revoke_volunteer_invite(
 @router.get("/donors/{id_or_slug}", response_model=Donor)
 def get_donor_by_slug_or_id(id_or_slug: str) -> Donor:
     for donor in store.donors.values():
-        if donor.id == id_or_slug or slugify(donor.name) == id_or_slug:
+        if donor_matches_public_slug(donor, id_or_slug):
             return donor
     raise HTTPException(status_code=404, detail="Donor not found")
 

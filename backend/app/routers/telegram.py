@@ -2,13 +2,15 @@ from fastapi import APIRouter, HTTPException, Depends, Header, Request
 import requests
 from typing import Dict, Any, Optional
 import re
-from datetime import datetime, timezone
+from contextvars import ContextVar
+from datetime import datetime, time as dt_time, timezone
+from zoneinfo import ZoneInfo
 
 from app.core.config import get_settings
 from app.models import (
-    TelegramDonationResult, 
-    TelegramLink, 
-    TelegramLinkRequest, 
+    TelegramDonationResult,
+    TelegramLink,
+    TelegramLinkRequest,
     TelegramActivationRequest,
     TelegramAuthState,
     SlaveBot,
@@ -17,6 +19,8 @@ from app.models import (
     Role,
     DonationCreate,
     DonationItem,
+    Donation,
+    DonationStatus,
 )
 from app.services.demo_store import store
 from app.services.auth_service import verify_firebase_token
@@ -36,8 +40,333 @@ from app.services.csr_report_service import (
     get_csr_pdf_bytes,
     list_donor_csr_reports,
 )
+from app.services.telegram_locale_service import localize_outbound_message, resolve_telegram_locale
 
 router = APIRouter(prefix="/telegram", tags=["telegram"])
+
+_slave_locale: ContextVar[str] = ContextVar("_slave_locale", default="en")
+
+
+def _accuracy_telegram_lines(donation: Donation) -> list[str]:
+    acc = donation.accuracy
+    if not acc:
+        return []
+    pct = round(float(acc.score) * 100)
+    lines = [f"Accuracy signal: {pct}% ({acc.band}) · {acc.recommendation}"]
+    if acc.explanation:
+        txt = acc.explanation.strip().replace("\n", " ")
+        if len(txt) > 200:
+            txt = txt[:197] + "..."
+        lines.append(f"Why: {txt}")
+    return lines
+
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def _weather_context_line(donation: Donation) -> str | None:
+    w = donation.weather_at_listing
+    if not w:
+        return None
+    bits = [f"{w.temp_c:.0f}°C outdoor"]
+    if w.conditions:
+        bits.append(str(w.conditions))
+    return "Weather near venue (OpenWeather): " + ", ".join(bits)
+
+
+def _weather_telegram_lines(donation: Donation) -> list[str]:
+    line = _weather_context_line(donation)
+    return [line] if line else []
+
+
+def _answer_slave_callback_query(callback_query_id: str, token_encrypted: str, text: str | None = None) -> None:
+    try:
+        token = kms_service.decrypt(token_encrypted)
+        requests.post(
+            f"https://api.telegram.org/bot{token}/answerCallbackQuery",
+            json={"callback_query_id": callback_query_id, "text": (text or "")[:200]},
+            timeout=8,
+        )
+    except Exception as exc:
+        print(f"answerCallbackQuery failed: {exc}")
+
+
+def _parse_prepared_time_today_ist(fragment: str) -> datetime | None:
+    fragment = fragment.strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})$", fragment)
+    if not m:
+        return None
+    h, mn = int(m.group(1)), int(m.group(2))
+    if h > 23 or mn > 59:
+        return None
+    today = datetime.now(IST).date()
+    local = datetime.combine(today, dt_time(hour=h, minute=mn), tzinfo=IST)
+    return local.astimezone(timezone.utc)
+
+
+def _parse_telegram_operational_text(raw: str) -> dict[str, Any]:
+    """Free-form lines → optional DonationCreate operational fields."""
+    out: dict[str, Any] = {}
+    if not raw or not raw.strip():
+        return out
+    if raw.strip().lower() in ("/skip", "skip", "none", "-"):
+        return out
+    block = raw.strip()
+    for line in block.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if low.startswith("temp") or low.startswith("storage"):
+            m = re.search(r"(\d+(?:\.\d+)?)", line)
+            if m:
+                out["storage_ambient_temp_c"] = float(m.group(1))
+        elif low.startswith("fridge") or low.startswith("refrigerat"):
+            rest = re.sub(r"^(fridge|refrigeration)\s*[:=]?\s*", "", line, flags=re.I).strip().lower()
+            if rest in ("y", "yes", "true", "1"):
+                out["held_in_refrigeration"] = True
+            elif rest in ("n", "no", "false", "0"):
+                out["held_in_refrigeration"] = False
+        elif low.startswith("prepared") or low.startswith("cooked"):
+            rest = re.sub(r"^(prepared|cooked)\s*[:=]?\s*", "", line, flags=re.I).strip()
+            dt = _parse_prepared_time_today_ist(rest)
+            if dt:
+                out["food_prepared_at"] = dt
+        elif low.startswith("notes"):
+            rest = re.sub(r"^notes\s*[:=]?\s*", "", line, flags=re.I).strip()
+            if rest:
+                prev = (out.get("operational_metrics_notes") or "").strip()
+                out["operational_metrics_notes"] = (prev + " " + rest).strip() if prev else rest
+        elif len(line) > 2:
+            prev = (out.get("operational_metrics_notes") or "").strip()
+            out["operational_metrics_notes"] = (prev + " " + line).strip() if prev else line
+
+    if "food_prepared_at" not in out:
+        m = re.search(r"\b(\d{1,2}):(\d{2})\b", block)
+        if m:
+            dt = _parse_prepared_time_today_ist(m.group(0))
+            if dt:
+                out["food_prepared_at"] = dt
+    return out
+
+
+def _download_telegram_file_bytes(token_encrypted: str, file_id: str) -> bytes:
+    token_plain = kms_service.decrypt(token_encrypted)
+    fr = requests.get(
+        f"https://api.telegram.org/bot{token_plain}/getFile",
+        params={"file_id": file_id},
+        timeout=15,
+    ).json()
+    if not fr.get("ok"):
+        raise RuntimeError(fr.get("description", "getFile failed"))
+    path = fr["result"]["file_path"]
+    img_resp = requests.get(f"https://api.telegram.org/file/bot{token_plain}/{path}", timeout=45)
+    img_resp.raise_for_status()
+    return img_resp.content
+
+
+def _telegram_prompt_operational_metrics(slave_bot: SlaveBot, chat_id: str) -> None:
+    keyboard = {"inline_keyboard": [[{"text": "⏭ Skip (no extra details)", "callback_data": "slave_op_skip"}]]}
+    msg = (
+        "Optional — kitchen & storage (helps AI routing; weather uses your venue from FoodBridge profile):\n\n"
+        "Reply with lines like:\n"
+        "temp: 24\n"
+        "fridge: yes\n"
+        "prepared: 14:30\n"
+        "notes: blast chilled after lunch\n\n"
+        "Or send /skip or tap Skip."
+    )
+    _send_telegram_reply(chat_id, msg, token_encrypted=slave_bot.bot_token, reply_markup=keyboard)
+
+
+def _complete_telegram_donation_post(
+    donor_id: str,
+    slave_bot: SlaveBot,
+    chat_id: str,
+    conv_state: ConversationState,
+    operational: dict[str, Any],
+) -> dict[str, Any]:
+    """Create donation after optional operational metrics (multi-item or deferred photo)."""
+    items = list(conv_state.donation_items or [])
+    pending_fid = conv_state.pending_photo_file_id
+
+    op_notes = operational.get("operational_metrics_notes")
+    if isinstance(op_notes, str):
+        op_notes = op_notes.strip() or None
+
+    base_chat_note = f"Posted from Telegram bot chat {chat_id}"
+
+    try:
+        if pending_fid:
+            kg = float(conv_state.pending_photo_kg or 10.0)
+            meals = int(conv_state.pending_photo_meals or 50)
+            cap = (conv_state.pending_photo_caption or "").strip()
+            notes_body = cap or "Posted from Telegram photo"
+            content = _download_telegram_file_bytes(slave_bot.bot_token, pending_fid)
+            payload = DonationCreate(
+                donor_id=donor_id,
+                food_type="mixed meals",
+                quantity_kg=kg,
+                meal_count=meals,
+                notes=notes_body,
+                source="telegram",
+                telegram_chat_id=chat_id,
+                storage_ambient_temp_c=operational.get("storage_ambient_temp_c"),
+                held_in_refrigeration=operational.get("held_in_refrigeration"),
+                food_prepared_at=operational.get("food_prepared_at"),
+                operational_metrics_notes=op_notes,
+            )
+            donation = store.create_donation(payload, image_bytes=content)
+            store.clear_conversation_state(chat_id)
+            _send_telegram_photo_donation_result(donation, donor_id, slave_bot, chat_id)
+            return {"ok": True}
+
+        if not items:
+            _send_telegram_reply(
+                chat_id,
+                "Nothing to post. Start again with /donation.",
+                token_encrypted=slave_bot.bot_token,
+            )
+            store.clear_conversation_state(chat_id)
+            return {"ok": True}
+
+        total_qty = round(sum(item.quantity_kg for item in items), 2)
+        total_meals = int(sum(item.meal_count for item in items))
+        primary_food = items[0].food_type
+
+        payload = DonationCreate(
+            donor_id=donor_id,
+            food_type=primary_food,
+            quantity_kg=total_qty,
+            meal_count=total_meals,
+            items=items,
+            notes=base_chat_note,
+            source="telegram",
+            telegram_chat_id=chat_id,
+            storage_ambient_temp_c=operational.get("storage_ambient_temp_c"),
+            held_in_refrigeration=operational.get("held_in_refrigeration"),
+            food_prepared_at=operational.get("food_prepared_at"),
+            operational_metrics_notes=op_notes,
+        )
+        donation = store.create_donation(payload)
+        store.clear_conversation_state(chat_id)
+        _send_telegram_multi_item_donation_result(donation, donor_id, slave_bot, chat_id, items)
+        return {"ok": True}
+    except Exception as exc:
+        store.clear_conversation_state(chat_id)
+        _send_telegram_reply(chat_id, f"Could not create donation: {exc}", token_encrypted=slave_bot.bot_token)
+        return {"ok": True}
+
+
+def _send_telegram_multi_item_donation_result(
+    donation: Donation,
+    donor_id: str,
+    slave_bot: SlaveBot,
+    chat_id: str,
+    items: list,
+) -> None:
+    if donation.status == DonationStatus.pending_scan_retry:
+        msg_lines = [
+            "⚠️ Gemini needs clearer details for this surplus.",
+            f"Scan: {donation.scan.reason}",
+            "Run /donation again with clearer item names — one more try before manual review.",
+        ]
+        msg_lines.extend(_accuracy_telegram_lines(donation))
+        msg_lines.extend(_weather_telegram_lines(donation))
+        _send_telegram_reply(chat_id, "\n".join(msg_lines), token_encrypted=slave_bot.bot_token)
+        return
+    if donation.status == DonationStatus.needs_review:
+        msg_lines = [
+            "📋 This listing needs manual review before NGOs see it.",
+            f"Detail: {donation.scan.reason}",
+            "Check /track for updates.",
+        ]
+        msg_lines.extend(_accuracy_telegram_lines(donation))
+        msg_lines.extend(_weather_telegram_lines(donation))
+        _send_telegram_reply(chat_id, "\n".join(msg_lines), token_encrypted=slave_bot.bot_token)
+        return
+
+    top_ngo_name = "nearest NGO"
+    maps_link = "https://maps.google.com"
+    if donation.ngo_queue:
+        top = donation.ngo_queue[0]
+        top_ngo_name = top.ngo_name
+        donor = store.donors.get(donor_id)
+        ngo = store.ngos.get(top.ngo_id)
+        if donor and ngo:
+            maps_link = (
+                f"https://www.google.com/maps/dir/?api=1&origin={donor.location.lat},{donor.location.lng}"
+                f"&destination={ngo.location.lat},{ngo.location.lng}&travelmode=driving"
+            )
+
+    item_lines = "\n".join(
+        [f"{idx + 1}. {item.food_type} - {item.quantity_kg:g} kg, serves {item.meal_count}" for idx, item in enumerate(items)]
+    )
+    msg_lines = [
+        f"Donation request has been sent to {top_ngo_name}.",
+        "Items:",
+        item_lines,
+        f"Total Quantity: {donation.quantity_kg:g} kg",
+        f"Total Serves: {donation.meal_count}",
+        f"Pickup timer: {logical_minutes_from_timedelta((donation.expires_at - datetime.now(timezone.utc)).total_seconds())} min",
+        f"Track route: {maps_link}",
+    ]
+    msg_lines.extend(_accuracy_telegram_lines(donation))
+    msg_lines.extend(_weather_telegram_lines(donation))
+    _send_telegram_reply(chat_id, "\n".join(msg_lines), token_encrypted=slave_bot.bot_token)
+
+
+def _send_telegram_photo_donation_result(
+    donation: Donation,
+    donor_id: str,
+    slave_bot: SlaveBot,
+    chat_id: str,
+) -> None:
+    if donation.status == DonationStatus.pending_scan_retry:
+        lines = [
+            "⚠️ Photo or caption wasn’t clear enough for Gemini.",
+            f"Reason: {donation.scan.reason}",
+            "Send another food photo with quantity (e.g. biryani 18 kg). One more try before admin review.",
+        ]
+        lines.extend(_accuracy_telegram_lines(donation))
+        lines.extend(_weather_telegram_lines(donation))
+        _send_telegram_reply(chat_id, "\n".join(lines), token_encrypted=slave_bot.bot_token)
+        return
+    if donation.status == DonationStatus.needs_review:
+        lines = [
+            "📋 This listing needs manual review before NGOs see it.",
+            f"Detail: {donation.scan.reason}",
+            "We’ll notify you — use /track for status.",
+        ]
+        lines.extend(_accuracy_telegram_lines(donation))
+        lines.extend(_weather_telegram_lines(donation))
+        _send_telegram_reply(chat_id, "\n".join(lines), token_encrypted=slave_bot.bot_token)
+        return
+
+    top_ngo_name = "nearest NGO"
+    maps_link = "https://maps.google.com"
+    if donation.ngo_queue:
+        top = donation.ngo_queue[0]
+        top_ngo_name = top.ngo_name
+        donor = store.donors.get(donor_id)
+        ngo = store.ngos.get(top.ngo_id)
+        if donor and ngo:
+            maps_link = (
+                f"https://www.google.com/maps/dir/?api=1&origin={donor.location.lat},{donor.location.lng}"
+                f"&destination={ngo.location.lat},{ngo.location.lng}&travelmode=driving"
+            )
+
+    lines = [
+        f"Photo scanned → {donation.food_type}.",
+        f"Request routed toward {top_ngo_name}.",
+        f"Quantity: {donation.quantity_kg:g} kg · Serves: {donation.meal_count}",
+        f"Pickup timer: {logical_minutes_from_timedelta((donation.expires_at - datetime.now(timezone.utc)).total_seconds())} min",
+        f"Route: {maps_link}",
+    ]
+    lines.extend(_accuracy_telegram_lines(donation))
+    lines.extend(_weather_telegram_lines(donation))
+    _send_telegram_reply(chat_id, "\n".join(lines), token_encrypted=slave_bot.bot_token)
+
 
 # --- Master Bot Routes ---
 
@@ -201,7 +530,40 @@ async def slave_webhook(
     callback_data = (callback.get("data") or "").strip()
     callback_chat_id = str(callback.get("message", {}).get("chat", {}).get("id") or "")
     effective_chat_id = chat_id or callback_chat_id
-    
+
+    from_user = message.get("from") or callback.get("from") or {}
+    caption = (message.get("caption") or "").strip()
+    locale = resolve_telegram_locale(from_user, text, caption)
+    locale_token = _slave_locale.set(locale)
+    try:
+        return await _slave_webhook_inner(
+            donor_id,
+            slave_bot,
+            update,
+            message,
+            text,
+            chat_id,
+            callback,
+            callback_data,
+            effective_chat_id,
+        )
+    finally:
+        _slave_locale.reset(locale_token)
+
+
+async def _slave_webhook_inner(
+    donor_id: str,
+    slave_bot: SlaveBot,
+    update: Dict[str, Any],
+    message: Dict[str, Any],
+    text: str,
+    chat_id: str,
+    callback: Dict[str, Any],
+    callback_data: str,
+    effective_chat_id: str,
+) -> Dict[str, Any]:
+    """Slave webhook logic with `_slave_locale` already set for outbound localization."""
+
     # Handle /start for first-time slave activation
     if text.startswith("/start"):
         if not slave_bot.slave_chat_id:
@@ -213,7 +575,12 @@ async def slave_webhook(
             f"👋 Welcome to your FoodBridge bot!\n\n"
             f"Restaurant: {donor.name if donor else 'Unknown'}\n"
             f"FSSAI: {donor.fssai_license if donor else 'N/A'}\n\n"
-            "Commands:\n/donation - Post food\n/track - Active donations\n/reports - FSSAI certificates\n/generate - FSSAI generate/send\n/csrreports - CSR report list\n/csrgenerate - Generate/send CSR report\n/help - Support"
+            "Commands:\n"
+            "/donation — Post surplus (then optional kitchen temp / fridge / prepared time)\n"
+            "Photo — Send a food photo + caption (kg or servings); optional details next\n"
+            "/track — Active donations (accuracy + weather context)\n"
+            "/reports — FSSAI certificates\n/generate — FSSAI generate/send\n"
+            "/csrreports — CSR list\n/csrgenerate — CSR send\n/help — Full help"
         )
         _send_telegram_reply(chat_id, reply, token_encrypted=slave_bot.bot_token)
         return {"ok": True}
@@ -223,15 +590,13 @@ async def slave_webhook(
             chat_id,
             (
                 "FoodBridge Bot Commands:\n"
-                "/donation - Post a new food donation\n"
-                "/track - View your active donation statuses\n"
-                "/reports - View generated and pending certificates\n"
-                "/generate <UID|donation_id> - Generate/send FSSAI certificate\n"
-                "/generate preview <UID|donation_id> - Send sample FSSAI PDF only\n"
-                "/csrreports - View CSR reports list\n"
-                "/csrgenerate <report_id|latest> - Generate/send CSR report\n"
-                "/csrgenerate preview <report_id|latest> - Send sample CSR PDF only\n"
-                "/help - Show this help message"
+                "/donation — Multi-item surplus; after items you can add optional signals:\n"
+                "  temp (°C), fridge yes/no, prepared HH:MM, notes — or Skip.\n"
+                "Photo — Picture + caption (kg or servings); same optional step.\n"
+                "(Weather near your venue uses your FoodBridge profile location.)\n\n"
+                "/track — Active donations + accuracy + outdoor weather line\n"
+                "/reports — Certificates\n/generate — FSSAI PDF\n"
+                "/csrreports — CSR list\n/csrgenerate — CSR PDF\n/help — This message"
             ),
             token_encrypted=slave_bot.bot_token,
         )
@@ -256,6 +621,18 @@ async def slave_webhook(
     if callback_data.startswith("slave_csr_preview_approve|") or callback_data.startswith("slave_csr_preview_discard|"):
         return await _handle_slave_csr_preview_callback(donor_id, slave_bot, effective_chat_id, callback_data)
 
+    # Photo-first donation (PRD): Gemini Vision on image before matching — standalone flow
+    if "photo" in message:
+        conv_state_photo = store.get_conversation_state(chat_id)
+        if not conv_state_photo or conv_state_photo.step not in {
+            ConversationStep.awaiting_food_type,
+            ConversationStep.awaiting_quantity,
+            ConversationStep.awaiting_quantity_text,
+            ConversationStep.awaiting_more_items,
+            ConversationStep.awaiting_operational_metrics,
+        }:
+            return await _handle_slave_photo(donor_id, slave_bot, update)
+
     # Handle /donation flow
     conv_state = store.get_conversation_state(chat_id)
     if text.startswith("/donation") or "callback_query" in update or (
@@ -264,13 +641,10 @@ async def slave_webhook(
             ConversationStep.awaiting_quantity,
             ConversationStep.awaiting_quantity_text,
             ConversationStep.awaiting_more_items,
+            ConversationStep.awaiting_operational_metrics,
         }
     ):
         return await _handle_slave_donation_flow(donor_id, slave_bot, update)
-
-    # Handle Photo Upload (Donation)
-    if "photo" in message:
-        return await _handle_slave_photo(donor_id, slave_bot, update)
 
     return {"ok": True}
 
@@ -417,6 +791,17 @@ async def _handle_slave_donation_flow(donor_id: str, slave_bot: SlaveBot, update
     text = (update.get("message", {}).get("text", "") or "").strip()
     conv_state = store.get_conversation_state(chat_id)
 
+    if callback_data == "slave_op_skip":
+        sc = store.get_conversation_state(chat_id)
+        cq_id = callback.get("id")
+        if sc and sc.step == ConversationStep.awaiting_operational_metrics:
+            if cq_id:
+                _answer_slave_callback_query(cq_id, slave_bot.bot_token)
+            return _complete_telegram_donation_post(donor_id, slave_bot, chat_id, sc, {})
+        if cq_id:
+            _answer_slave_callback_query(cq_id, slave_bot.bot_token, "Nothing to skip here.")
+        return {"ok": True}
+
     if text == "/donation":
         store.update_conversation_state(
             chat_id,
@@ -425,6 +810,10 @@ async def _handle_slave_donation_flow(donor_id: str, slave_bot: SlaveBot, update
             quantity_kg=None,
             meal_count=None,
             donation_items=[],
+            pending_photo_file_id=None,
+            pending_photo_kg=None,
+            pending_photo_meals=None,
+            pending_photo_caption=None,
         )
         _send_telegram_reply(
             chat_id,
@@ -434,6 +823,23 @@ async def _handle_slave_donation_flow(donor_id: str, slave_bot: SlaveBot, update
         return {"ok": True}
 
     if not conv_state:
+        return {"ok": True}
+
+    if conv_state.step == ConversationStep.awaiting_operational_metrics:
+        msg = update.get("message") or {}
+        if msg.get("photo"):
+            _send_telegram_reply(
+                chat_id,
+                "Send kitchen details as text, or tap Skip — don’t send another photo in this step.",
+                token_encrypted=slave_bot.bot_token,
+            )
+            return {"ok": True}
+        if text:
+            tl = text.strip().lower()
+            if tl in ("/skip", "skip"):
+                return _complete_telegram_donation_post(donor_id, slave_bot, chat_id, conv_state, {})
+            ops = _parse_telegram_operational_text(text)
+            return _complete_telegram_donation_post(donor_id, slave_bot, chat_id, conv_state, ops)
         return {"ok": True}
 
     if conv_state and callback_data in {"slave_add_more_item", "slave_post_surplus"}:
@@ -557,54 +963,55 @@ def _finalize_multi_item_donation(donor_id: str, slave_bot: SlaveBot, chat_id: s
         store.clear_conversation_state(chat_id)
         return {"ok": True}
 
-    total_qty = round(sum(item.quantity_kg for item in items), 2)
-    total_meals = int(sum(item.meal_count for item in items))
-    primary_food = items[0].food_type
-    donation = store.create_donation(
-        DonationCreate(
-            donor_id=donor_id,
-            food_type=primary_food,
-            quantity_kg=total_qty,
-            meal_count=total_meals,
-            items=items,
-            source="telegram",
-            telegram_chat_id=chat_id,
-            notes=f"Posted from Telegram bot chat {chat_id}",
-        )
-    )
-    store.clear_conversation_state(chat_id)
-
-    top_ngo_name = "nearest NGO"
-    maps_link = "https://maps.google.com"
-    if donation.ngo_queue:
-        top = donation.ngo_queue[0]
-        top_ngo_name = top.ngo_name
-        donor = store.donors.get(donor_id)
-        ngo = store.ngos.get(top.ngo_id)
-        if donor and ngo:
-            maps_link = (
-                f"https://www.google.com/maps/dir/?api=1&origin={donor.location.lat},{donor.location.lng}"
-                f"&destination={ngo.location.lat},{ngo.location.lng}&travelmode=driving"
-            )
-
-    item_lines = "\n".join([f"{idx + 1}. {item.food_type} - {item.quantity_kg:g} kg, serves {item.meal_count}" for idx, item in enumerate(items)])
-    _send_telegram_reply(
+    store.update_conversation_state(
         chat_id,
-        (
-            f"Donation request has been sent to {top_ngo_name}.\n"
-            f"Items:\n{item_lines}\n"
-            f"Total Quantity: {donation.quantity_kg:g} kg\n"
-            f"Total Serves: {donation.meal_count}\n"
-            f"Pickup timer: {logical_minutes_from_timedelta((donation.expires_at - datetime.now(timezone.utc)).total_seconds())} min\n"
-            f"Track route: {maps_link}"
-        ),
-        token_encrypted=slave_bot.bot_token,
+        step=ConversationStep.awaiting_operational_metrics,
+        donation_items=items,
     )
+    _telegram_prompt_operational_metrics(slave_bot, chat_id)
     return {"ok": True}
 
 
+def _parse_kg_and_meals_from_caption(caption: str) -> tuple[float, int]:
+    cap = caption or ""
+    m = re.search(r"(\d+(?:\.\d+)?)\s*kg", cap, re.I)
+    if m:
+        kg = min(500.0, max(0.5, float(m.group(1))))
+        return kg, max(1, int(kg * 5))
+    m2 = re.search(r"(\d+)\s*(?:serv|meals|people|plates)", cap, re.I)
+    if m2:
+        meals = max(1, int(m2.group(1)))
+        kg = max(1.0, meals / 5.0)
+        return kg, meals
+    return 10.0, 50
+
+
 async def _handle_slave_photo(donor_id: str, slave_bot: SlaveBot, update: Dict[str, Any]):
-    # Process donation creation logic
+    message = update.get("message") or {}
+    chat_id = str(message.get("chat", {}).get("id") or "")
+    photos = message.get("photo") or []
+    if not photos:
+        _send_telegram_reply(
+            chat_id,
+            "Send a food photo. Add a caption with quantity (e.g. biryani 18 kg or 90 servings).",
+            token_encrypted=slave_bot.bot_token,
+        )
+        return {"ok": True}
+
+    caption = (message.get("caption") or "").strip()
+    kg, meals = _parse_kg_and_meals_from_caption(caption)
+    file_id = photos[-1]["file_id"]
+
+    store.update_conversation_state(
+        chat_id,
+        step=ConversationStep.awaiting_operational_metrics,
+        pending_photo_file_id=file_id,
+        pending_photo_kg=kg,
+        pending_photo_meals=meals,
+        pending_photo_caption=caption,
+        donation_items=[],
+    )
+    _telegram_prompt_operational_metrics(slave_bot, chat_id)
     return {"ok": True}
 
 
@@ -614,6 +1021,7 @@ async def _handle_slave_track(donor_id: str, slave_bot: SlaveBot, chat_id: str):
         "accepted",
         "assigned",
         "pending_match",
+        "pending_scan_retry",
         "needs_review",
         "escalated_radius_2",
         "escalated_radius_3",
@@ -641,6 +1049,10 @@ async def _handle_slave_track(donor_id: str, slave_bot: SlaveBot, chat_id: str):
         lines.append(
             f"- {item.food_type} ({item.quantity_kg:g} kg) | {item.status.value.upper()} | NGO: {ngo_name} | Timer: {remaining_min} min"
         )
+        for acc_line in _accuracy_telegram_lines(item):
+            lines.append(f"  · {acc_line}")
+        for wx in _weather_telegram_lines(item):
+            lines.append(f"  · {wx}")
 
     _send_telegram_reply(chat_id, "\n".join(lines), token_encrypted=slave_bot.bot_token)
     return {"ok": True}
@@ -1115,6 +1527,9 @@ def _send_telegram_reply(
         token = settings.telegram_bot_token
     elif token_encrypted:
         token = kms_service.decrypt(token_encrypted)
+        loc = _slave_locale.get()
+        if loc and loc != "en":
+            text = localize_outbound_message(text, loc)  # type: ignore[arg-type]
     else:
         return
 

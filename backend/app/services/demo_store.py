@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 from math import asin, cos, radians, sin, sqrt
 import os
 import re
+from uuid import uuid4
 from app.services.notification_service import send_fcm_notification
 
 from app.core.cloud_clients import get_firestore_client, get_realtime_database
@@ -16,6 +18,7 @@ from app.models import (
     DonorTelegramUpdate,
     Donation,
     DonationCreate,
+    DonationScanRecord,
     DonationItem,
     DonationStatus,
     DonationStatusUpdate,
@@ -47,9 +50,14 @@ from app.models import (
     VolunteerProfile,
     VolunteerInviteToken,
     VolunteerTaskStatus,
+    scan_phase2_contract_version,
 )
 from app.services.log_service import log_event
 from app.services.time_scale import scaled_timedelta_minutes
+from app.services.accuracy_engine import evaluate_donation_accuracy
+from app.services.openweather_service import fetch_weather_at_listing
+from app.services.ml_training_export_service import export_donation_ml_event, terminal_statuses
+from app.services.donor_scoring import recompute_all_donor_scores
 
 
 def distance_km(a_lat: float, a_lng: float, b_lat: float, b_lng: float) -> float:
@@ -62,22 +70,104 @@ def distance_km(a_lat: float, a_lng: float, b_lat: float, b_lng: float) -> float
     return round(2 * radius * asin(sqrt(value)), 2)
 
 
-from app.services.gemini_service import scan_food_with_gemini
+def coerce_legacy_donation_payload(raw: dict) -> dict:
+    """
+    Firestore rows written before Phase 2 may omit `scan` and `expires_at`.
+    Fill defaults so `Donation` validates (e.g. seeded `sgen_*` docs).
+    """
+    data = dict(raw)
+    food_type = (data.get("food_type") or "mixed").strip() or "mixed"
+
+    scan_raw = data.get("scan")
+    if not scan_raw:
+        data["scan"] = {
+            "passed": True,
+            "confidence": 0.75,
+            "reason": "Legacy Firestore record: scan metadata missing; backfilled at load.",
+            "detected_food_type": food_type,
+            "freshness_window_minutes": 180,
+            "fallback_used": True,
+        }
+    elif isinstance(scan_raw, dict):
+        s = scan_raw
+        scan_coerced = {
+            "passed": bool(s.get("passed", True)),
+            "confidence": float(s["confidence"]) if s.get("confidence") is not None else 0.75,
+            "reason": (s.get("reason") or "Legacy scan row incomplete; coerced at load.").strip(),
+            "detected_food_type": (s.get("detected_food_type") or food_type).strip() or food_type,
+            "freshness_window_minutes": max(1, int(s.get("freshness_window_minutes") or 180)),
+            "model_id": s.get("model_id"),
+            "model_version": s.get("model_version"),
+            "fallback_used": bool(s.get("fallback_used", True)),
+        }
+        if s.get("generated_at") is not None:
+            scan_coerced["generated_at"] = s["generated_at"]
+        data["scan"] = scan_coerced
+    else:
+        data["scan"] = {
+            "passed": True,
+            "confidence": 0.75,
+            "reason": "Legacy Firestore record: scan field had unexpected shape; reset at load.",
+            "detected_food_type": food_type,
+            "freshness_window_minutes": 180,
+            "fallback_used": True,
+        }
+
+    sd = data.get("scan")
+    fw = max(1, int(sd.get("freshness_window_minutes") or 180)) if isinstance(sd, dict) else 180
+
+    if data.get("expires_at") is None:
+        created = data.get("created_at")
+        if created is not None:
+            ca = created
+            if isinstance(ca, datetime) and ca.tzinfo is None:
+                ca = ca.replace(tzinfo=timezone.utc)
+            data["expires_at"] = ca + scaled_timedelta_minutes(fw)
+        else:
+            data["expires_at"] = datetime.now(timezone.utc) + scaled_timedelta_minutes(fw)
+
+    return data
+
+
+from app.services.vertex_ai_service import scan_food_with_vertex_ai
 
 EMERGENCY_REQUESTS_COLLECTION = "emergency_pools_v2"
 
 def scan_food(food_type: str, notes: str | None = None) -> GeminiScan:
     # Local/dev override to avoid external AI dependency.
     if os.environ.get("DISABLE_AI_INTEGRATION", "false").lower() == "true":
+        s = get_settings()
         return GeminiScan(
             passed=True,
             confidence=0.95,
             reason="AI integration disabled; trusted manual/demo mode",
             detected_food_type=food_type,
             freshness_window_minutes=180,
+            model_id=s.vertex_ai_model_id,
+            model_version=s.vertex_ai_model_version,
+            fallback_used=True,
         )
     # We could pass image bytes here if available, but for now we use text hints
-    return scan_food_with_gemini(b"", food_type_hint=food_type)
+    return scan_food_with_vertex_ai(b"", food_type_hint=food_type)
+
+
+def scan_food_multimodal(food_type: str, notes: str | None, image_bytes: bytes | None) -> GeminiScan:
+    """PRD: photo-first scan — use image bytes when provided; else text-only path."""
+    if os.environ.get("DISABLE_AI_INTEGRATION", "false").lower() == "true":
+        s = get_settings()
+        return GeminiScan(
+            passed=True,
+            confidence=0.95,
+            reason="AI integration disabled; trusted manual/demo mode",
+            detected_food_type=food_type,
+            freshness_window_minutes=180,
+            model_id=s.vertex_ai_model_id,
+            model_version=s.vertex_ai_model_version,
+            fallback_used=True,
+        )
+    if image_bytes:
+        return scan_food_with_vertex_ai(image_bytes, food_type_hint=food_type)
+    return scan_food(food_type, notes)
 
 
 class DemoStore:
@@ -98,6 +188,8 @@ class DemoStore:
         self.conversation_states: dict[str, ConversationState] = {}
         self.firestore_enabled = True
         self._bootstrap_firestore()
+        self._sync_impact_feed()
+        self._sync_entity_directory_feed()
 
     def upload_image_to_gcp(self, image_bytes: bytes, filename: str) -> str:
         from app.core.cloud_clients import ensure_bucket_exists
@@ -140,6 +232,7 @@ class DemoStore:
                 entity_id=ngo.id,
             )
 
+
     def _firestore(self):
         if not self.firestore_enabled or not get_settings().firestore_sync_enabled:
             return None
@@ -158,6 +251,22 @@ class DemoStore:
             db.collection(collection).document(doc_id).set(payload, merge=True, timeout=5)
         except Exception:
             self.firestore_enabled = False
+
+    def _persist_donation_scan_record(
+        self,
+        *,
+        donation_id: str,
+        donor_id: str,
+        scan: GeminiScan,
+        kind: Literal["donation_created", "scan_retry", "migrated_from_donation"],
+    ) -> None:
+        rec = DonationScanRecord(
+            donation_id=donation_id,
+            donor_id=donor_id,
+            kind=kind,
+            scan=scan,
+        )
+        self._write_doc("donation_scans", rec.id, rec)
 
     def _publish_event(self, topic_id: str, data: dict) -> None:
         if not get_settings().google_cloud_project:
@@ -216,6 +325,67 @@ class DemoStore:
                 volunteer_uid = volunteer_user.id if volunteer_user else None
             if volunteer_uid:
                 set_or_delete(f"active_feeds/volunteer/{volunteer_uid}/{donation.id}")
+        self._sync_impact_feed(root)
+
+    def _sync_impact_feed(self, root=None) -> None:
+        try:
+            root = root or get_realtime_database()
+        except Exception:
+            return
+        try:
+            payload = self.impact().model_dump(mode="json")
+            root.child("metrics/impact/global").set(payload)
+        except Exception as exc:
+            # Cloud Run ADC often lacks RTDB rules until the GCP SA is granted access in Firebase.
+            print(f"Impact feed sync skipped (RTDB): {exc}")
+
+    def _sync_entity_directory_feed(self, root=None) -> None:
+        try:
+            root = root or get_realtime_database()
+        except Exception:
+            return
+
+        donors_payload = {
+            donor.id: {
+                "id": donor.id,
+                "name": donor.name,
+                "area": donor.area,
+                "trust_score": donor.score.trust_score if donor.score else None,
+                "trust_tier": donor.score.trust_tier if donor.score else None,
+            }
+            for donor in self.donors.values()
+        }
+        ngos_payload = {
+            ngo.id: {"id": ngo.id, "name": ngo.name, "area": ngo.area}
+            for ngo in self.ngos.values()
+        }
+        volunteers_payload = {
+            volunteer.id: {
+                "id": volunteer.id,
+                "name": volunteer.name,
+                "ngo_id": volunteer.ngo_id,
+                "status": volunteer.status,
+            }
+            for volunteer in self.volunteers.values()
+        }
+
+        try:
+            root.child("directory/entities/donors").set(donors_payload)
+            root.child("directory/entities/ngos").set(ngos_payload)
+            root.child("directory/entities/volunteers").set(volunteers_payload)
+        except Exception as exc:
+            print(f"Entity directory feed sync skipped (RTDB): {exc}")
+
+    def _recompute_all_donor_scores(self) -> None:
+        all_donations = list(self.donations.values())
+        by_id = recompute_all_donor_scores(list(self.donors.values()), all_donations)
+        for donor_id, donor in list(self.donors.items()):
+            score = by_id.get(donor_id)
+            if score is None:
+                continue
+            donor.score = score
+            self.donors[donor_id] = donor
+            self._write_doc("donors", donor.id, donor)
 
     def _sync_emergency_feed(self, request: EmergencyRequest) -> None:
         try:
@@ -331,6 +501,9 @@ class DemoStore:
                 if data:
                     try:
                         from app.models import MatchScore
+                        if not data.get("id"):
+                            data["id"] = doc.id
+                        data = coerce_legacy_donation_payload(data)
                         ngo_queue_data = data.get("ngo_queue", [])
                         data["ngo_queue"] = [MatchScore(**q) for q in ngo_queue_data]
                         self.donations[data["id"]] = Donation(**data)
@@ -349,6 +522,7 @@ class DemoStore:
 
             for request in self.emergency_requests.values():
                 self._sync_emergency_feed(request)
+            self._recompute_all_donor_scores()
             
             print(f"Loaded from Firestore: {len(self.donors)} donors, {len(self.ngos)} NGOs, {len(self.donations)} donations")
             
@@ -357,6 +531,7 @@ class DemoStore:
             print("Falling back to empty in-memory entities")
             self.donors = {}
             self.ngos = {}
+            self._recompute_all_donor_scores()
             self._seed_users()
 
     def _seed_donation(self) -> None:
@@ -373,7 +548,7 @@ class DemoStore:
             DonationStatusUpdate(status=DonationStatus.accepted, ngo_id=donation.ngo_queue[0].ngo_id),
         )
 
-    def rank_ngos(self, payload: DonationCreate) -> list[MatchScore]:
+    def _rank_ngos_heuristic(self, payload: DonationCreate) -> list[MatchScore]:
         donor = self.donors[payload.donor_id]
         location = payload.location or donor.location
         primary_food_type = payload.items[0].food_type if payload.items else payload.food_type
@@ -400,14 +575,103 @@ class DemoStore:
 
         return sorted(scores, key=lambda item: item.total_score, reverse=True)
 
-    def create_donation(self, payload: DonationCreate) -> Donation:
+    def rank_ngos(self, payload: DonationCreate) -> list[MatchScore]:
+        base = self._rank_ngos_heuristic(payload)
+        settings = get_settings()
+        if os.environ.get("DISABLE_AI_INTEGRATION", "false").lower() == "true":
+            return base
+        if not settings.matching_vertex_enabled:
+            return base
+        try:
+            from app.services.ngo_matching_vertex import refine_ngo_queue_with_vertex
+
+            donor = self.donors[payload.donor_id]
+            primary_food_type = payload.items[0].food_type if payload.items else payload.food_type
+            return refine_ngo_queue_with_vertex(
+                primary_food_type=primary_food_type,
+                quantity_kg=payload.quantity_kg,
+                donor_area=donor.area,
+                heuristic_scores=base,
+            )
+        except Exception as exc:
+            print(f"rank_ngos: Gemini refinement skipped ({exc})")
+            return base
+
+    def _donation_to_create_payload(self, donation: Donation) -> DonationCreate:
+        """Rebuild ranking input from a persisted donation (Pub/Sub matching worker)."""
+        return DonationCreate(
+            donor_id=donation.donor_id,
+            food_type=donation.food_type,
+            quantity_kg=donation.quantity_kg,
+            meal_count=donation.meal_count,
+            items=list(donation.items),
+            location=donation.location,
+            photo_url=donation.photo_url,
+            notes=donation.notes,
+            food_prepared_at=donation.food_prepared_at,
+            storage_ambient_temp_c=donation.storage_ambient_temp_c,
+            held_in_refrigeration=donation.held_in_refrigeration,
+            operational_metrics_notes=donation.operational_metrics_notes,
+        )
+
+    def run_matching_for_donation(self, donation_id: str) -> None:
+        """
+        Idempotent: ranks NGOs and notifies — used by Pub/Sub subscriber or inline fallback.
+        Skips donations that already have a queue or are in manual review.
+        """
+        donation = self.donations.get(donation_id)
+        if not donation:
+            return
+        if donation.status in {DonationStatus.needs_review, DonationStatus.pending_scan_retry}:
+            return
+        if donation.ngo_queue:
+            return
+        payload = self._donation_to_create_payload(donation)
+        queue = self.rank_ngos(payload)
+        top = queue[0] if queue else None
+        donation.ngo_queue = queue
+        donation.current_radius_km = top.distance_km if top else 0.0
+        donation.notified_ngo_ids = [top.ngo_id] if top else []
+        donation.updated_at = datetime.now(timezone.utc)
+        wave_now = datetime.now(timezone.utc)
+        if queue:
+            donation.status = DonationStatus.notified
+            donation.wave_started_at = wave_now
+            donation.wave_expires_at = wave_now + scaled_timedelta_minutes(30)
+        self.donations[donation.id] = donation
+        self._write_doc("donations", donation.id, donation)
+        self._sync_active_feed(donation)
+        self._create_donation_notifications(donation)
+        if donation.status == DonationStatus.notified:
+            from app.services.escalation_service import escalation_service
+
+            escalation_service.schedule_escalation(donation)
+
+    def create_donation(self, payload: DonationCreate, *, image_bytes: bytes | None = None) -> Donation:
         donor = self.donors[payload.donor_id]
-        items = payload.items or [
-            DonationItem(food_type=payload.food_type, quantity_kg=payload.quantity_kg, meal_count=payload.meal_count)
-        ]
+        settings = get_settings()
+        use_pubsub_pipeline = settings.pubsub_matching_enabled
+
+        if image_bytes is not None:
+            hint = payload.food_type or (payload.notes or "")[:200] or "mixed meals"
+            scan = scan_food_multimodal(hint, payload.notes, image_bytes)
+            items = payload.items or [
+                DonationItem(
+                    food_type=scan.detected_food_type or payload.food_type,
+                    quantity_kg=payload.quantity_kg,
+                    meal_count=payload.meal_count,
+                )
+            ]
+        else:
+            items = payload.items or [
+                DonationItem(food_type=payload.food_type, quantity_kg=payload.quantity_kg, meal_count=payload.meal_count)
+            ]
         total_qty = round(sum(item.quantity_kg for item in items), 2)
         total_meals = int(sum(item.meal_count for item in items))
         primary_food_type = items[0].food_type if items else payload.food_type
+        photo_url = payload.photo_url
+        if image_bytes is not None:
+            photo_url = self.upload_image_to_gcp(image_bytes, f"{uuid4().hex}.jpg")
         payload = DonationCreate(
             **{
                 **payload.model_dump(),
@@ -415,25 +679,63 @@ class DemoStore:
                 "quantity_kg": total_qty,
                 "meal_count": total_meals,
                 "items": items,
+                "photo_url": photo_url,
             }
         )
-        scan = scan_food(primary_food_type, payload.notes)
-        queue = self.rank_ngos(payload)
+        if image_bytes is None:
+            scan = scan_food(primary_food_type, payload.notes)
+        queue = [] if use_pubsub_pipeline else self.rank_ngos(payload)
         donation = Donation.from_create(payload, donor, scan, queue)
-        if not scan.passed:
+        # Weather uses donor profile coordinates from DB (authoritative venue location).
+        weather = fetch_weather_at_listing(donor.location.lat, donor.location.lng)
+        donation.weather_at_listing = weather
+        donation.accuracy = evaluate_donation_accuracy(
+            scan,
+            quantity_kg=payload.quantity_kg,
+            notes=payload.notes,
+            donor_trust_score=donor.score.trust_score if donor.score else None,
+            donor_trust_tier=donor.score.trust_tier if donor.score else None,
+            food_prepared_at=payload.food_prepared_at,
+            storage_ambient_temp_c=payload.storage_ambient_temp_c,
+            held_in_refrigeration=payload.held_in_refrigeration,
+            operational_metrics_notes=payload.operational_metrics_notes,
+            weather=weather,
+            listing_created_at=donation.created_at,
+        )
+        rec = donation.accuracy.recommendation
+        hard_fail = rec == "auto_reject"
+        soft_fail = (not scan.passed) or rec == "manual_review"
+        if hard_fail or soft_fail:
+            donation.ngo_queue = []
+            donation.notified_ngo_ids = []
+            donation.current_radius_km = 0.0
+
+        if hard_fail:
             donation.status = DonationStatus.needs_review
+            donation.scan_phase_failures = max(donation.scan_phase_failures, 1)
+        elif soft_fail:
+            donation.status = DonationStatus.pending_scan_retry
+            donation.scan_phase_failures = 1
+        elif use_pubsub_pipeline:
+            donation.status = DonationStatus.pending_match
         elif queue:
             donation.status = DonationStatus.notified
+        else:
+            donation.status = DonationStatus.pending_match
+
+        matching_deferred = bool(use_pubsub_pipeline and donation.status == DonationStatus.pending_match)
+
         self.donations[donation.id] = donation
         self._write_doc("donations", donation.id, donation)
+        self._persist_donation_scan_record(
+            donation_id=donation.id,
+            donor_id=donation.donor_id,
+            scan=donation.scan,
+            kind="donation_created",
+        )
         self._sync_active_feed(donation)
-        self._create_donation_notifications(donation)
 
-        if donation.status == DonationStatus.notified:
-            from app.services.escalation_service import escalation_service
-            escalation_service.schedule_escalation(donation)
-
-        self._publish_event("foodbridge-donations", {
+        pub_body = {
             "event": "donation_created",
             "donation_id": donation.id,
             "donor_id": donation.donor_id,
@@ -441,8 +743,26 @@ class DemoStore:
             "quantity_kg": donation.quantity_kg,
             "lat": payload.location.lat if payload.location else donor.location.lat,
             "lng": payload.location.lng if payload.location else donor.location.lng,
-            "timestamp": donation.created_at.isoformat()
-        })
+            "timestamp": donation.created_at.isoformat(),
+            "matching_deferred": matching_deferred,
+        }
+        self._publish_event("foodbridge-donations", pub_body)
+
+        if hard_fail:
+            self._create_donation_notifications(donation)
+        elif soft_fail:
+            self._notify_scan_retry_donor(donation)
+        elif use_pubsub_pipeline:
+            if settings.pubsub_matching_inline_completion:
+                self.run_matching_for_donation(donation.id)
+        else:
+            self._create_donation_notifications(donation)
+            if donation.status == DonationStatus.notified:
+                from app.services.escalation_service import escalation_service
+
+                escalation_service.schedule_escalation(donation)
+
+        donation = self.donations[donation.id]
         log_event(
             event_type="donation_created",
             actor_id=donation.donor_id,
@@ -451,7 +771,266 @@ class DemoStore:
             payload={"food_type": donation.food_type, "quantity_kg": donation.quantity_kg},
         )
 
+        self._recompute_all_donor_scores()
+        self._sync_entity_directory_feed()
+
+        export_donation_ml_event(donation, "donation_created")
+
         return donation
+
+    def _notify_scan_retry_donor(self, donation: Donation) -> None:
+        self.create_notification(
+            Notification(
+                donation_id=donation.id,
+                recipient_role=Role.donor,
+                recipient_id=donation.donor_id,
+                title="Photo or details need another try",
+                body=(
+                    f"Gemini could not confidently verify {donation.food_type}. "
+                    "Update your listing or add a clearer photo, then tap Retry on the donate screen."
+                ),
+                channel="dashboard",
+            )
+        )
+
+    def retry_donation_scan(self, donation_id: str, payload: DonationCreate, *, image_bytes: bytes | None = None) -> Donation:
+        """Second scan attempt for `pending_scan_retry`. Further soft failure → Super Admin queue."""
+        donation = self.donations.get(donation_id)
+        if not donation:
+            raise ValueError("Donation not found")
+        if donation.status != DonationStatus.pending_scan_retry:
+            raise ValueError("Donation is not awaiting scan retry")
+        if payload.donor_id != donation.donor_id:
+            raise ValueError("Donor mismatch")
+        donor = self.donors[payload.donor_id]
+        settings = get_settings()
+        use_pubsub_pipeline = settings.pubsub_matching_enabled
+
+        if image_bytes is not None:
+            hint = payload.food_type or (payload.notes or "")[:200] or "mixed meals"
+            scan = scan_food_multimodal(hint, payload.notes, image_bytes)
+            items = payload.items or [
+                DonationItem(
+                    food_type=scan.detected_food_type or payload.food_type,
+                    quantity_kg=payload.quantity_kg,
+                    meal_count=payload.meal_count,
+                )
+            ]
+        else:
+            items = payload.items or [
+                DonationItem(food_type=payload.food_type, quantity_kg=payload.quantity_kg, meal_count=payload.meal_count)
+            ]
+        total_qty = round(sum(item.quantity_kg for item in items), 2)
+        total_meals = int(sum(item.meal_count for item in items))
+        primary_food_type = items[0].food_type if items else payload.food_type
+        photo_url = payload.photo_url
+        if image_bytes is not None:
+            photo_url = self.upload_image_to_gcp(image_bytes, f"{uuid4().hex}.jpg")
+        payload = DonationCreate(
+            **{
+                **payload.model_dump(),
+                "food_type": primary_food_type,
+                "quantity_kg": total_qty,
+                "meal_count": total_meals,
+                "items": items,
+                "photo_url": photo_url,
+            }
+        )
+        if image_bytes is None:
+            scan = scan_food(primary_food_type, payload.notes)
+
+        queue = [] if use_pubsub_pipeline else self.rank_ngos(payload)
+
+        donation.scan = scan
+        weather = fetch_weather_at_listing(donor.location.lat, donor.location.lng)
+        donation.weather_at_listing = weather
+        listing_ts = datetime.now(timezone.utc)
+        donation.accuracy = evaluate_donation_accuracy(
+            scan,
+            quantity_kg=payload.quantity_kg,
+            notes=payload.notes,
+            donor_trust_score=donor.score.trust_score if donor.score else None,
+            donor_trust_tier=donor.score.trust_tier if donor.score else None,
+            food_prepared_at=payload.food_prepared_at,
+            storage_ambient_temp_c=payload.storage_ambient_temp_c,
+            held_in_refrigeration=payload.held_in_refrigeration,
+            operational_metrics_notes=payload.operational_metrics_notes,
+            weather=weather,
+            listing_created_at=listing_ts,
+        )
+        donation.items = list(payload.items)
+        donation.food_type = primary_food_type
+        donation.quantity_kg = total_qty
+        donation.meal_count = total_meals
+        donation.notes = payload.notes
+        donation.food_prepared_at = payload.food_prepared_at
+        donation.storage_ambient_temp_c = payload.storage_ambient_temp_c
+        donation.held_in_refrigeration = payload.held_in_refrigeration
+        donation.operational_metrics_notes = payload.operational_metrics_notes
+        donation.photo_url = payload.photo_url
+        donation.scan_contract_version = scan_phase2_contract_version(scan)
+
+        rec = donation.accuracy.recommendation
+        hard_fail = rec == "auto_reject"
+        soft_fail = (not scan.passed) or rec == "manual_review"
+
+        top_q = queue[0] if queue else None
+        donation.expires_at = datetime.now(timezone.utc) + scaled_timedelta_minutes(scan.freshness_window_minutes)
+        donation.current_radius_km = top_q.distance_km if top_q else 0.0
+
+        if hard_fail:
+            donation.status = DonationStatus.needs_review
+            donation.scan_phase_failures = max(donation.scan_phase_failures, 2)
+            donation.ngo_queue = []
+            donation.notified_ngo_ids = []
+        elif soft_fail:
+            donation.status = DonationStatus.needs_review
+            donation.scan_phase_failures = 2
+            donation.ngo_queue = []
+            donation.notified_ngo_ids = []
+        elif use_pubsub_pipeline:
+            donation.status = DonationStatus.pending_match
+            donation.ngo_queue = []
+            donation.notified_ngo_ids = []
+        else:
+            donation.ngo_queue = queue
+            donation.notified_ngo_ids = [queue[0].ngo_id] if queue else []
+            donation.status = DonationStatus.notified if queue else DonationStatus.pending_match
+            wave_now = datetime.now(timezone.utc)
+            donation.wave_started_at = wave_now
+            donation.wave_expires_at = wave_now + scaled_timedelta_minutes(30)
+
+        donation.updated_at = datetime.now(timezone.utc)
+        self.donations[donation.id] = donation
+        self._write_doc("donations", donation.id, donation)
+        self._persist_donation_scan_record(
+            donation_id=donation.id,
+            donor_id=donation.donor_id,
+            scan=donation.scan,
+            kind="scan_retry",
+        )
+        self._sync_active_feed(donation)
+
+        pub_body = {
+            "event": "donation_retry_scan",
+            "donation_id": donation.id,
+            "donor_id": donation.donor_id,
+            "food_type": donation.food_type,
+            "status": donation.status.value,
+            "matching_deferred": bool(use_pubsub_pipeline and donation.status == DonationStatus.pending_match),
+            "timestamp": donation.updated_at.isoformat(),
+        }
+        self._publish_event("foodbridge-donations", pub_body)
+
+        if hard_fail or soft_fail:
+            self._create_donation_notifications(donation)
+        elif use_pubsub_pipeline:
+            if settings.pubsub_matching_inline_completion:
+                self.run_matching_for_donation(donation.id)
+        else:
+            self._create_donation_notifications(donation)
+            if donation.status == DonationStatus.notified:
+                from app.services.escalation_service import escalation_service
+
+                escalation_service.schedule_escalation(donation)
+
+        self._recompute_all_donor_scores()
+        self._sync_entity_directory_feed()
+        log_event(
+            event_type="donation_scan_retry",
+            actor_id=donation.donor_id,
+            donation_id=donation.id,
+            status=donation.status.value,
+            payload={"food_type": donation.food_type, "scan_phase_failures": donation.scan_phase_failures},
+        )
+        export_donation_ml_event(self.donations[donation.id], "donation_created")
+        return self.donations[donation.id]
+
+    def admin_resolve_scan_review(self, donation_id: str, *, approved: bool) -> Donation:
+        """Super Admin: approve routes to NGOs; reject marks wasted."""
+        donation = self.donations.get(donation_id)
+        if not donation:
+            raise ValueError("Donation not found")
+        if donation.status != DonationStatus.needs_review:
+            raise ValueError("Donation is not in manual review")
+
+        if not approved:
+            donation.status = DonationStatus.wasted
+            donation.updated_at = datetime.now(timezone.utc)
+            self.donations[donation.id] = donation
+            self._write_doc("donations", donation.id, donation)
+            self._sync_active_feed(donation)
+            self.create_notification(
+                Notification(
+                    donation_id=donation.id,
+                    recipient_role=Role.donor,
+                    recipient_id=donation.donor_id,
+                    title="Listing not cleared",
+                    body=f"Your {donation.food_type} donation was not released to NGOs after review.",
+                    channel="dashboard",
+                )
+            )
+            log_event(
+                event_type="donation_admin_rejected",
+                actor_id="super_admin",
+                donation_id=donation.id,
+                status=donation.status.value,
+                payload={},
+            )
+            return donation
+
+        settings = get_settings()
+        use_pubsub_pipeline = settings.pubsub_matching_enabled
+        payload = self._donation_to_create_payload(donation)
+        queue = [] if use_pubsub_pipeline else self.rank_ngos(payload)
+        donation.ngo_queue = queue
+        top = queue[0] if queue else None
+        donation.current_radius_km = top.distance_km if top else 0.0
+        donation.notified_ngo_ids = [top.ngo_id] if top else []
+        wave_now = datetime.now(timezone.utc)
+        donation.wave_started_at = wave_now
+        donation.wave_expires_at = wave_now + scaled_timedelta_minutes(30)
+        donation.updated_at = wave_now
+
+        if use_pubsub_pipeline:
+            donation.status = DonationStatus.pending_match
+        elif queue:
+            donation.status = DonationStatus.notified
+        else:
+            donation.status = DonationStatus.pending_match
+
+        self.donations[donation.id] = donation
+        self._write_doc("donations", donation.id, donation)
+        self._sync_active_feed(donation)
+
+        if use_pubsub_pipeline:
+            if settings.pubsub_matching_inline_completion:
+                self.run_matching_for_donation(donation.id)
+        else:
+            self._create_donation_notifications(donation)
+            if donation.status == DonationStatus.notified:
+                from app.services.escalation_service import escalation_service
+
+                escalation_service.schedule_escalation(donation)
+
+        self.create_notification(
+            Notification(
+                donation_id=donation.id,
+                recipient_role=Role.donor,
+                recipient_id=donation.donor_id,
+                title="Listing cleared",
+                body=f"Super Admin approved your {donation.food_type} donation — NGOs can now respond.",
+                channel="dashboard",
+            )
+        )
+        log_event(
+            event_type="donation_admin_approved",
+            actor_id="super_admin",
+            donation_id=donation.id,
+            status=donation.status.value,
+            payload={},
+        )
+        return self.donations[donation.id]
 
     def create_donor(self, payload: DonorCreate) -> Donor:
         if any(donor.fssai_license == payload.fssai_license for donor in self.donors.values()):
@@ -483,6 +1062,7 @@ class DemoStore:
             ),
         )
         self.donors[donor.id] = donor
+        self._recompute_all_donor_scores()
         self.users[donor.id] = UserProfile(
             id=donor.id,
             role=Role.donor,
@@ -493,6 +1073,7 @@ class DemoStore:
         )
         self._write_doc("donors", donor.id, donor)
         self._write_doc("users", donor.id, self.users[donor.id])
+        self._sync_entity_directory_feed()
         self.create_notification(
             Notification(
                 recipient_role=Role.super_admin,
@@ -541,6 +1122,7 @@ class DemoStore:
         )
         self._write_doc("ngos", ngo.id, ngo)
         self._write_doc("users", ngo.id, self.users[ngo.id])
+        self._sync_entity_directory_feed()
         self.create_notification(
             Notification(
                 recipient_role=Role.super_admin,
@@ -568,6 +1150,7 @@ class DemoStore:
             )
         self.users[user_id] = user
         self._write_doc("users", user.id, user)
+        self._sync_entity_directory_feed()
         return user
 
     def invite_volunteer(self, payload: VolunteerInviteCreate) -> VolunteerProfile:
@@ -612,6 +1195,7 @@ class DemoStore:
         self._write_doc("volunteers", volunteer.id, volunteer)
         self._write_doc("volunteer_invites", token, invite)
         self._write_doc("users", volunteer.id, self.users[volunteer.id])
+        self._sync_entity_directory_feed()
         send_volunteer_invite_email(
             to_email=payload.email or "",
             volunteer_name=payload.name,
@@ -687,6 +1271,7 @@ class DemoStore:
         invite.used_by_uid = uid
         self.volunteer_invites[token] = invite
         self._write_doc("volunteer_invites", token, invite)
+        self._sync_entity_directory_feed()
         log_event(
             event_type="volunteer_registered_from_invite",
             actor_id=uid,
@@ -703,6 +1288,7 @@ class DemoStore:
         volunteer.status = "active" if approved else "rejected"
         self.volunteers[volunteer.id] = volunteer
         self._write_doc("volunteers", volunteer.id, volunteer)
+        self._sync_entity_directory_feed()
         log_event(
             event_type="volunteer_approval_updated",
             actor_id=ngo_id,
@@ -742,6 +1328,7 @@ class DemoStore:
         self.volunteer_invites[token] = invite
         self._write_doc("volunteers", volunteer.id, volunteer)
         self._write_doc("volunteer_invites", token, invite)
+        self._sync_entity_directory_feed()
 
         send_volunteer_invite_email(
             to_email=volunteer.email or "",
@@ -768,6 +1355,7 @@ class DemoStore:
         volunteer.status = "rejected"
         self.volunteers[volunteer.id] = volunteer
         self._write_doc("volunteers", volunteer.id, volunteer)
+        self._sync_entity_directory_feed()
         log_event(
             event_type="volunteer_invite_revoked",
             actor_id=ngo_id,
@@ -943,6 +1531,8 @@ class DemoStore:
                 donation.volunteer_task_status = VolunteerTaskStatus.delivered_confirmed
 
         self._write_doc("donations", donation.id, donation)
+        self._recompute_all_donor_scores()
+        self._sync_entity_directory_feed()
         self._sync_active_feed(donation)
         self._create_status_communication(donation, payload)
 
@@ -975,6 +1565,15 @@ class DemoStore:
                 "updated_at": donation.updated_at.isoformat(),
             },
         )
+
+        export_donation_ml_event(donation, "status_updated", previous_status=previous_status.value)
+        if donation.status.value in terminal_statuses() and previous_status.value not in terminal_statuses():
+            export_donation_ml_event(
+                donation,
+                "terminal",
+                previous_status=previous_status.value,
+                terminal_label=donation.status.value,
+            )
 
         return donation
 
@@ -1014,9 +1613,14 @@ class DemoStore:
 
     def create_emergency_request(self, payload: EmergencyRequestCreate) -> EmergencyRequest:
         ngo = self.ngos[payload.ngo_id]
-        city_donors = [donor for donor in self.donors.values() if donor.location.area and ngo.location.area]
-        if not city_donors:
-            city_donors = list(self.donors.values())
+        from app.services.emergency_pledge_vertex import select_emergency_donors_and_pledge_copy
+
+        donor_ids, pledge_copy = select_emergency_donors_and_pledge_copy(
+            payload=payload,
+            ngo=ngo,
+            donors=self.donors,
+            donations=list(self.donations.values()),
+        )
         request = EmergencyRequest(
             ngo_id=ngo.id,
             ngo_name=ngo.name,
@@ -1030,7 +1634,7 @@ class DemoStore:
             pickup_address=payload.pickup_address,
             min_contribution_kg=payload.min_contribution_kg,
             max_contribution_kg=payload.max_contribution_kg,
-            donor_targets=[donor.id for donor in city_donors],
+            donor_targets=donor_ids,
             deadline_at=datetime.now(timezone.utc) + scaled_timedelta_minutes(payload.deadline_minutes),
             popup_expires_at=datetime.now(timezone.utc) + scaled_timedelta_minutes(payload.deadline_minutes),
             notes=payload.notes,
@@ -1041,12 +1645,16 @@ class DemoStore:
         self._write_doc(EMERGENCY_REQUESTS_COLLECTION, request.id, request)
         self._sync_emergency_feed(request)
         for donor_id in request.donor_targets:
+            title, body = pledge_copy.get(donor_id) or (
+                f"Emergency pledge · {request.ngo_name}",
+                f"{request.ngo_name} needs ~{request.quantity_goal_kg:g} kg {request.food_type}. {request.reason[:120]}",
+            )
             self.create_notification(
                 Notification(
                     recipient_role=Role.donor,
                     recipient_id=donor_id,
-                    title="Emergency pledge request",
-                    body=f"{request.ngo_name} needs {request.quantity_goal_kg:g} kg {request.food_type} by deadline.",
+                    title=title,
+                    body=body,
                     channel="fcm",
                 )
             )
@@ -1494,34 +2102,25 @@ class DemoStore:
         )
 
     def predictions(self) -> list[Prediction]:
-        return [
-            Prediction(
-                id="pred_gachibowli_1800",
-                donor_id="donor_hitech_banquet",
-                donor_name="Hitec Banquet Works",
-                area="Gachibowli",
-                food_type="rice and dal",
-                predicted_time="18:00-19:00",
-                probability=0.78,
-                nearby_ngos=2,
-            ),
-            Prediction(
-                id="pred_banjara_2130",
-                donor_id="donor_banjara_grand",
-                donor_name="Banjara Grand Buffet",
-                area="Banjara Hills",
-                food_type="biryani",
-                predicted_time="21:00-22:00",
-                probability=0.84,
-                nearby_ngos=3,
-            ),
-        ]
+        from app.services.surplus_prediction_service import compute_surplus_predictions
+
+        return compute_surplus_predictions(self)
 
     def impact(self) -> ImpactStats:
         completed = [item for item in self.donations.values() if item.status == DonationStatus.completed]
-        active = [item for item in self.donations.values() if item.status not in {DonationStatus.completed, DonationStatus.expired}]
-        meals = 87400 + sum(item.completed_meals_served or 0 for item in completed)
-        kg_saved = 23400 + sum(item.quantity_kg for item in completed)
+        active = [
+            item
+            for item in self.donations.values()
+            if item.status
+            not in {
+                DonationStatus.completed,
+                DonationStatus.expired,
+                DonationStatus.declined,
+                DonationStatus.wasted,
+            }
+        ]
+        meals = sum(item.completed_meals_served or item.meal_count or 0 for item in completed)
+        kg_saved = sum(item.quantity_kg for item in completed)
         return ImpactStats(
             meals_served=meals,
             kg_saved=round(kg_saved, 1),

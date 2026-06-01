@@ -1,6 +1,7 @@
 type DonationStatus =
   | "draft"
   | "pending_match"
+  | "pending_scan_retry"
   | "notified"
   | "accepted"
   | "declined"
@@ -15,6 +16,7 @@ type DonationStatus =
 const statusStyles: Record<string, string> = {
   draft: "bg-stone-200 text-stone-600 ring-stone-300",
   pending_match: "bg-saffron/20 text-saffron ring-saffron/40",
+  pending_scan_retry: "bg-amber-100 text-amber-900 ring-amber-300",
   notified: "bg-saffron/20 text-ink ring-saffron/40",
   accepted: "bg-leaf/15 text-leaf ring-leaf/30",
   declined: "bg-chili/15 text-chili ring-chili/30",
@@ -30,6 +32,7 @@ const statusStyles: Record<string, string> = {
 const statusLabels: Record<string, string> = {
   draft: "Draft",
   pending_match: "Pending Match",
+  pending_scan_retry: "Retry scan",
   notified: "Notified",
   accepted: "Accepted",
   declined: "Declined",

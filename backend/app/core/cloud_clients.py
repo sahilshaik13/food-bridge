@@ -127,7 +127,7 @@ def initialize_vertex_ai(settings: Settings | None = None) -> bool:
     settings = settings or get_settings()
     vertexai.init(
         project=settings.google_cloud_project,
-        location=settings.gcp_location,
+        location=settings.vertex_ai_location,
         credentials=get_google_credentials(),
     )
     return True

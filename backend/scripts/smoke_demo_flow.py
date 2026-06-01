@@ -9,24 +9,65 @@ import sys
 ROOT_DIR = Path(__file__).resolve().parents[2]
 BACKEND_DIR = ROOT_DIR / "backend"
 os.environ["FIRESTORE_SYNC_ENABLED"] = "false"
+os.environ.setdefault("DISABLE_AI_INTEGRATION", "true")
 sys.path.insert(0, str(BACKEND_DIR))
 
 from app.models import (  # noqa: E402
     CommunicationMessageCreate,
+    Donor,
     DonorCreate,
     DonorTelegramUpdate,
     DonationCreate,
     DonationStatus,
     DonationStatusUpdate,
+    EmergencyContributionCreate,
     EmergencyRequestCreate,
+    Location,
+    Ngo,
     Role,
     TelegramLinkRequest,
 )
 from app.services.demo_store import DemoStore  # noqa: E402
 
 
+def _ensure_smoke_entities(store: DemoStore) -> None:
+    """When Firestore is empty (offline smoke), insert IDs the script asserts on."""
+    if "ngo_city_meals" not in store.ngos:
+        store.ngos["ngo_city_meals"] = Ngo(
+            id="ngo_city_meals",
+            name="City Meals NGO",
+            area="Hyderabad",
+            focus="Food redistribution",
+            ngo_darpan_id="smoke_darpan_city_meals",
+            beneficiary_count=120,
+            food_preferences=["rice", "dal", "roti", "biryani"],
+            location=Location(area="Hyderabad", address="Hyderabad", lat=17.385, lng=78.4867),
+            verification_status="verified",
+            coordinator_name="Coordinator",
+            coordinator_phone="+91 9000000001",
+        )
+    if "donor_hitech_banquet" not in store.donors:
+        store.donors["donor_hitech_banquet"] = Donor(
+            id="donor_hitech_banquet",
+            name="Hitec Banquet Works",
+            area="Hitech City",
+            type="Restaurant",
+            fssai_license="13622011009876",
+            contact_name="Manager",
+            phone="+91 9000000000",
+            email="hitech@example.com",
+            location=Location(area="Hitech City", address="Hyderabad", lat=17.4479, lng=78.3915),
+            avg_surplus_kg="20-40 kg/day",
+            verification_status="verified",
+        )
+    store._recompute_all_donor_scores()
+    store._seed_users()
+    store._sync_entity_directory_feed()
+
+
 def main() -> int:
     store = DemoStore()
+    _ensure_smoke_entities(store)
 
     donation = store.create_donation(
         DonationCreate(
@@ -65,10 +106,15 @@ def main() -> int:
             food_type="roti and dal",
             quantity_goal_kg=60,
             deadline_minutes=90,
+            reason="Shelter meal gap tonight",
         )
     )
     assert request.donor_targets
-    assert request.pledged_kg > 0
+    pooled = store.contribute_emergency_pool(
+        request.id,
+        EmergencyContributionCreate(donor_id="donor_hitech_banquet", quantity_kg=60),
+    )
+    assert pooled.pledged_kg > 0
 
     registered = store.create_donor(
         DonorCreate(
@@ -124,7 +170,8 @@ def main() -> int:
     assert store.list_messages(telegram_result.donation_id)
 
     impact = store.impact()
-    assert impact.meals_served >= 87400
+    # Offline smoke: one completed donation above (~176 meals). With Firestore, totals can be much larger.
+    assert impact.meals_served >= 176
     assert store.predictions()
 
     print("Smoke flow passed: donation -> match -> accept -> complete -> impact -> emergency -> Telegram -> communications.")

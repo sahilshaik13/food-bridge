@@ -13,15 +13,15 @@ from pathlib import Path
 
 from app.core.cloud_clients import get_firestore_client, get_gcp_storage_client
 from app.core.config import get_settings
-from app.models import Donation
+from app.core.latex_paths import get_latex_template_root
+from app.models import Donation, DonationItem
 from app.services.demo_store import store
 
 
 CERT_COLLECTION = "certificates"
 CERT_BUCKET_PREFIX = "certificates/fssai"
 _local_certificate_cache: dict[str, dict[str, Any]] = {}
-ROOT_DIR = Path(__file__).resolve().parents[3]
-FSSAI_TEMPLATE_PATH = ROOT_DIR / "foodbridge_certificate.tex"
+FSSAI_TEMPLATE_PATH = get_latex_template_root() / "foodbridge_certificate.tex"
 
 
 def _is_donation_completed(donation: Donation) -> bool:
@@ -57,7 +57,30 @@ def build_verify_url(certificate_uid: str, donation_id: str, generated_at_iso: s
     return f"{base}/reports/verify/{certificate_uid}?sig={signature}"
 
 
+def _normalize_for_pdflatex(value: str) -> str:
+    """pdfLaTeX + inputenc T1 cannot handle many Unicode symbols; normalize before escaping."""
+    if not value:
+        return value
+    s = value
+    for u, rep in (
+        ("\u2264", "<="),
+        ("\u2265", ">="),
+        ("\u2026", "..."),
+        ("≤", "<="),
+        ("≥", ">="),
+        ("…", "..."),
+        ("\u2013", "-"),
+        ("\u2014", "-"),
+        ("–", "-"),
+        ("—", "-"),
+        ("\u00a0", " "),
+    ):
+        s = s.replace(u, rep)
+    return s
+
+
 def _latex_escape(value: str) -> str:
+    value = _normalize_for_pdflatex(str(value))
     replacements = {
         "\\": r"\textbackslash{}",
         "&": r"\&",
@@ -79,6 +102,95 @@ def _latex_escape(value: str) -> str:
 def _latex_escape_table_cell(value: str) -> str:
     # Escape cell content only; row separators are injected separately.
     return _latex_escape(value).replace("\n", " ")
+
+
+def _truncate_display(value: str, max_len: int = 220) -> str:
+    value = (value or "").strip()
+    if len(value) <= max_len:
+        return value
+    return value[: max_len - 1] + "..."
+
+
+def _normalized_items_list(donation: Donation) -> list[DonationItem]:
+    if donation.items:
+        return list(donation.items)
+    return [
+        DonationItem(
+            food_type=donation.food_type,
+            quantity_kg=donation.quantity_kg,
+            meal_count=donation.meal_count,
+            condition=None,
+        )
+    ]
+
+
+def _condition_bullet_parts(donation: Donation, item: DonationItem, *, max_bullets: int = 6) -> list[str]:
+    """Short bullet lines for PDF (scan summary column); avoids long prose paragraphs."""
+    if item.condition and str(item.condition).strip():
+        return [_truncate_display(str(item.condition).strip(), 140)]
+    scan = donation.scan
+    declared = (item.food_type or "").strip() or (donation.food_type or "")
+    detected = (scan.detected_food_type or "").strip()
+    bullets: list[str] = []
+    bullets.append(
+        "Pre-redistribution scan: passed"
+        if scan.passed
+        else "Pre-redistribution scan: see platform record"
+    )
+    if detected and declared and detected.lower() != declared.lower():
+        bullets.append(f"Vision label: {detected}")
+        bullets.append(f"Declared on listing: {declared}")
+    elif detected:
+        bullets.append(f"Vision classification: {detected}")
+    else:
+        bullets.append(f"Declared category: {declared or '-'}")
+    bullets.append(f"Pickup window: <= {scan.freshness_window_minutes} min from listing")
+    if donation.accuracy:
+        acc = donation.accuracy
+        bullets.append(f"Quality check: {acc.band} ({acc.score:.0%})")
+    if scan.reason and scan.reason.strip():
+        bullets.append(_truncate_display(scan.reason.strip(), 110))
+    return bullets[:max_bullets]
+
+
+def _scan_summary_body_latex(donation: Donation, item: DonationItem) -> str:
+    """Second column of the separate Scan summary table; full-width X column wraps text."""
+    bullets = _condition_bullet_parts(donation, item)
+    if not bullets:
+        return r"\footnotesize --"
+    parts = [r"\textbullet~" + _latex_escape(b) for b in bullets]
+    inner = r" \newline ".join(parts)
+    return r"\raggedright\footnotesize\sloppy\setlength{\parskip}{3pt}" + inner
+
+
+def _condition_for_line(donation: Donation, item: DonationItem) -> str:
+    """Plain-text summary for APIs / Firestore (single line)."""
+    return "; ".join(_condition_bullet_parts(donation, item))
+
+
+def _primary_food_label(donation: Donation) -> str:
+    items = _normalized_items_list(donation)
+    if len(items) == 1:
+        return items[0].food_type or donation.food_type
+    names = [i.food_type for i in items if i.food_type]
+    if not names:
+        return donation.food_type
+    return f"Multi-item ({len(items)}): " + ", ".join(names[:4]) + ("..." if len(names) > 4 else "")
+
+
+def _certificate_food_attestation(donation: Donation) -> str:
+    scan = donation.scan
+    parts: list[str] = []
+    if scan.model_id or scan.model_version:
+        ver = " ".join(x for x in [scan.model_id, scan.model_version] if x)
+        parts.append(f"Scan engine: {ver}")
+    if scan.generated_at:
+        ts = scan.generated_at
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        parts.append(f"Scan time: {ts.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    parts.append("Line items reflect donor declarations aligned with the intake photo analysis.")
+    return _truncate_display(" · ".join(parts))
 
 
 def _replace_newcommand(tex: str, command: str, value: str) -> str:
@@ -150,14 +262,7 @@ def _render_fssai_pdf_bytes(
     tex = FSSAI_TEMPLATE_PATH.read_text(encoding="utf-8")
     donor_profile = store.donors.get(donation.donor_id)
     ngo_profile = store.ngos.get(donation.assigned_ngo_id) if donation.assigned_ngo_id else None
-    donation_items = donation.items or [
-        {
-            "food_type": donation.food_type,
-            "quantity_kg": donation.quantity_kg,
-            "meal_count": donation.meal_count,
-            "condition": "Fresh - Fit for Consumption",
-        }
-    ]
+    donation_items = _normalized_items_list(donation)
     created_ts = donation.created_at
     completed_ts = donation.completed_at or donation.delivery_confirmed_at or donation.updated_at
     duration_seconds = int((completed_ts - created_ts).total_seconds())
@@ -166,18 +271,24 @@ def _render_fssai_pdf_bytes(
     donor_city = donor_profile.location.area if donor_profile and donor_profile.location else "-"
     ngo_city = ngo_profile.location.area if ngo_profile and ngo_profile.location else "-"
     food_lines = []
+    scan_summary_lines = []
     for idx, item in enumerate(donation_items, start=1):
-        food_type = item.food_type if hasattr(item, "food_type") else item.get("food_type")
-        qty = item.quantity_kg if hasattr(item, "quantity_kg") else item.get("quantity_kg")
-        meals = item.meal_count if hasattr(item, "meal_count") else item.get("meal_count")
-        condition = item.condition if hasattr(item, "condition") else item.get("condition")
+        food_type = item.food_type
+        qty = item.quantity_kg
+        meals = item.meal_count
         safe_food = _latex_escape_table_cell(str(food_type or "-"))
         safe_qty = _latex_escape_table_cell(f"{float(qty or 0):g} kg")
         safe_meals = _latex_escape_table_cell(f"{int(meals or 0)} meals")
-        safe_condition = _latex_escape_table_cell(str(condition or "Fresh - Fit for Consumption"))
-        food_lines.append(f"{idx} & {safe_food} & {safe_qty} & {safe_meals} & {safe_condition} \\\\ \\hline")
+        food_lines.append(f"{idx} & {safe_food} & {safe_qty} & {safe_meals} \\\\ \\hline")
+        detail = _scan_summary_body_latex(donation, item)
+        scan_summary_lines.append(f"{idx} & {detail} \\\\ \\hline")
     verify_label = verify_url
-    food_rows = " ".join(food_lines) if food_lines else "1 & - & 0 kg & 0 meals & - \\\\ \\hline"
+    food_rows = " ".join(food_lines) if food_lines else "1 & - & 0 kg & 0 meals \\\\ \\hline"
+    scan_summary_rows = (
+        " ".join(scan_summary_lines) if scan_summary_lines else r"1 & \footnotesize -- \\ \hline"
+    )
+    primary_label = _primary_food_label(donation)
+    attestation = _certificate_food_attestation(donation)
     command_values = {
         "CertUID": _latex_escape(certificate_uid),
         "DonationID": _latex_escape(donation.id),
@@ -191,11 +302,12 @@ def _render_fssai_pdf_bytes(
         "NGOReg": _latex_escape(getattr(ngo_profile, "ngo_darpan_id", "-") if ngo_profile else "-"),
         "NGOContact": _latex_escape(getattr(ngo_profile, "coordinator_name", "-") if ngo_profile else "-"),
         "NGOCity": _latex_escape(ngo_city),
-        "FoodItem": _latex_escape(food_lines[0] if food_lines else "-"),
+        "FoodItem": _latex_escape(primary_label),
         "FoodQty": _latex_escape(f"{donation.quantity_kg:g} kg"),
         "MealCount": _latex_escape(f"{donation.meal_count} meals"),
-        "FoodCondition": _latex_escape("Fresh - Fit for Consumption"),
+        "FoodCondition": _latex_escape(attestation),
         "FoodRows": food_rows,
+        "ScanSummaryRows": scan_summary_rows,
         "CreatedAt": _latex_escape(created_ts.strftime("%Y-%m-%d %H:%M:%S UTC")),
         "CompletedAt": _latex_escape(completed_ts.strftime("%Y-%m-%d %H:%M:%S UTC")),
         "Duration": _latex_escape(f"{mins} minutes {secs} seconds"),
@@ -346,14 +458,19 @@ def ensure_fssai_certificate(
         "food_type": donation.food_type,
         "quantity_kg": donation.quantity_kg,
         "meal_count": donation.meal_count,
+        "certificate_food_summary": _certificate_food_attestation(donation),
+        "scan_detected_food_type": donation.scan.detected_food_type,
+        "scan_freshness_window_minutes": donation.scan.freshness_window_minutes,
         "items": [
             {
                 "food_type": item.food_type,
                 "quantity_kg": item.quantity_kg,
                 "meal_count": item.meal_count,
                 "condition": item.condition,
+                "certificate_condition_line": _condition_for_line(donation, item),
+                "certificate_condition_bullets": _condition_bullet_parts(donation, item),
             }
-            for item in (donation.items or [])
+            for item in _normalized_items_list(donation)
         ],
         "generated_at": generated_iso,
         "storage_path": path,
@@ -467,6 +584,9 @@ def verify_certificate(certificate_uid: str, signature: str) -> dict[str, Any]:
         "quantity_kg": meta.get("quantity_kg"),
         "meal_count": meta.get("meal_count"),
         "items": meta.get("items") or [],
+        "certificate_food_summary": meta.get("certificate_food_summary"),
+        "scan_detected_food_type": meta.get("scan_detected_food_type"),
+        "scan_freshness_window_minutes": meta.get("scan_freshness_window_minutes"),
         "generated_at": meta.get("generated_at"),
         "reason": None if valid else "signature_mismatch",
     }
